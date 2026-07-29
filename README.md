@@ -116,10 +116,16 @@ API then uses `postgresql+psycopg2://smartcart:smartcart@db:5432/smartcart`.
 The `Dockerfile` builds a Python 3.12 slim image that:
 
 - Installs dependencies from `requirements.txt`
-- Ships the FastAPI app, static storefront assets, and this `README.md`
+- Ships the FastAPI app, static storefront assets, and **`README.md`** (verified at build time)
 - Exposes **8904** (API/UI) and **8501** (optional Streamlit)
 - Includes a healthcheck on `/health`
 - Defaults to: `uvicorn app.main:app --host 0.0.0.0 --port 8904`
+
+Confirm README is inside a running container:
+
+```bash
+docker compose exec api head -n 5 /app/README.md
+```
 
 Persistent volumes (Compose): `smartcart_data` (SQLite), `smartcart_uploads`, `smartcart_logs`.
 

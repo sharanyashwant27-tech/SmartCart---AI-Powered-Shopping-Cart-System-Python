@@ -25,9 +25,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Application source (README.md is included via .dockerignore allow-list)
 COPY . .
+COPY README.md /app/README.md
 
 RUN mkdir -p /app/data /app/logs /app/uploads /app/static \
+    && test -f /app/README.md \
     && chmod -R a+rX /app
 
 EXPOSE 8904 8501
