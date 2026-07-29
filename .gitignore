@@ -1,0 +1,46 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment & secrets
+.env
+*.pem
+
+# Database & logs
+*.db
+*.sqlite3
+logs/
+*.log
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Uploads keep folder, ignore files
+uploads/*
+!uploads/.gitkeep
+
+# Local data
+data/

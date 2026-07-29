@@ -1,0 +1,134 @@
+# SmartCart Docker Compose
+# Default: API + storefront on http://localhost:8904
+# Optional Streamlit UI: docker compose --profile streamlit up --build
+# Optional Postgres:   docker compose --profile postgres up --build
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: smartcart-api:latest
+    container_name: smartcart-api
+    ports:
+      - "8904:8904"
+    environment:
+      APP_NAME: SmartCart
+      APP_ENV: development
+      DEBUG: "true"
+      API_HOST: "0.0.0.0"
+      API_PORT: "8904"
+      SECRET_KEY: smartcart-docker-dev-secret-change-me
+      DATABASE_URL: sqlite:////app/data/smartcart.db
+      CORS_ORIGINS: '["http://localhost:8904","http://127.0.0.1:8904","http://localhost:8501"]'
+      CURRENCY: usd
+      DEFAULT_TAX_RATE: "0.08"
+      DEFAULT_SHIPPING_FLAT: "5.99"
+      FREE_SHIPPING_THRESHOLD: "75.00"
+      ADMIN_EMAIL: admin@smartcart.com
+      ADMIN_PASSWORD: Admin@12345
+      ADMIN_FULL_NAME: SmartCart Admin
+      STRIPE_SECRET_KEY: sk_test_your_stripe_secret_key
+      STRIPE_PUBLISHABLE_KEY: pk_test_your_stripe_publishable_key
+    volumes:
+      - smartcart_data:/app/data
+      - smartcart_uploads:/app/uploads
+      - smartcart_logs:/app/logs
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8904
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8904/health')",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  # Optional Streamlit UI (profile: streamlit)
+  frontend:
+    image: smartcart-api:latest
+    container_name: smartcart-frontend
+    ports:
+      - "8501:8501"
+    environment:
+      SMARTCART_API_URL: http://api:8904/api/v1
+    depends_on:
+      api:
+        condition: service_healthy
+    command: >
+      streamlit run frontend/Home.py
+      --server.port 8501
+      --server.address 0.0.0.0
+      --browser.gatherUsageStats false
+    profiles: ["streamlit"]
+    restart: unless-stopped
+
+  # Optional Postgres (profile: postgres)
+  db:
+    image: postgres:16-alpine
+    container_name: smartcart-db
+    environment:
+      POSTGRES_USER: smartcart
+      POSTGRES_PASSWORD: smartcart
+      POSTGRES_DB: smartcart
+    ports:
+      - "5432:5432"
+    volumes:
+      - smartcart_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smartcart -d smartcart"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    profiles: ["postgres"]
+
+  api-postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: smartcart-api:latest
+    container_name: smartcart-api-pg
+    ports:
+      - "8904:8904"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://smartcart:smartcart@db:5432/smartcart
+      API_PORT: "8904"
+      SECRET_KEY: smartcart-docker-dev-secret-change-me
+      ADMIN_EMAIL: admin@smartcart.com
+      ADMIN_PASSWORD: Admin@12345
+      ADMIN_FULL_NAME: SmartCart Admin
+      CORS_ORIGINS: '["http://localhost:8904","http://127.0.0.1:8904"]'
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8904
+    profiles: ["postgres"]
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8904/health')",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
+volumes:
+  smartcart_data:
+  smartcart_uploads:
+  smartcart_logs:
+  smartcart_pgdata:

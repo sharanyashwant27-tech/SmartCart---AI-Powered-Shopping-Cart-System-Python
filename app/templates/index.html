@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SmartCart — AI-Powered Shopping</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Sora:wght@700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <a href="/" class="brand" id="brand-home" title="Go to shop">SmartCart</a>
+      <div class="brand-sub">AI-Powered Shopping · :8904</div>
+      <button class="nav-btn active" data-page="shop">Shop</button>
+      <button class="nav-btn" data-page="cart">Cart <span id="cart-badge" class="nav-badge hidden"></span></button>
+      <button class="nav-btn" data-page="orders">Orders</button>
+      <button class="nav-btn" data-page="account" id="nav-account">Login</button>
+      <button class="nav-btn hidden" data-page="admin" id="nav-admin">Admin Dashboard</button>
+      <button class="nav-btn hidden" data-page="catalog" id="nav-catalog">Manage Products</button>
+      <div class="user-box" id="user-box"></div>
+    </aside>
+    <main class="main" id="app"></main>
+  </div>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

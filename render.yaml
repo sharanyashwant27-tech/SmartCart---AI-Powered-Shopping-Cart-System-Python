@@ -1,0 +1,44 @@
+# Render.com blueprint — https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: smartcart-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: API_PORT
+        value: "8904"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: smartcart-db
+          property: connectionString
+      - key: CORS_ORIGINS
+        value: '["https://smartcart-web.onrender.com"]'
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_PUBLISHABLE_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+    dockerCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+  - type: web
+    name: smartcart-web
+    runtime: docker
+    plan: free
+    dockerCommand: streamlit run frontend/streamlit_app.py --server.port $PORT --server.address 0.0.0.0
+    envVars:
+      - key: SMARTCART_API_URL
+        value: https://smartcart-api.onrender.com/api/v1
+
+databases:
+  - name: smartcart-db
+    plan: free
+    databaseName: smartcart
+    user: smartcart
