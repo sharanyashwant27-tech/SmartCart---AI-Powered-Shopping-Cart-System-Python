@@ -18,7 +18,7 @@ services:
       DEBUG: "true"
       API_HOST: "0.0.0.0"
       API_PORT: "8904"
-      SECRET_KEY: smartcart-docker-dev-secret-change-me
+      SECRET_KEY: smartcart-dev-secret-key-change-in-production-8904
       DATABASE_URL: sqlite:////app/data/smartcart.db
       CORS_ORIGINS: '["http://localhost:8904","http://127.0.0.1:8904","http://localhost:8501"]'
       CURRENCY: usd
@@ -34,10 +34,14 @@ services:
       - smartcart_data:/app/data
       - smartcart_uploads:/app/uploads
       - smartcart_logs:/app/logs
+      - ./static:/app/static
+      - ./app/templates:/app/app/templates
+      - ./app:/app/app
     command: >
       uvicorn app.main:app
       --host 0.0.0.0
       --port 8904
+      --reload
     healthcheck:
       test:
         [
@@ -101,7 +105,7 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg2://smartcart:smartcart@db:5432/smartcart
       API_PORT: "8904"
-      SECRET_KEY: smartcart-docker-dev-secret-change-me
+      SECRET_KEY: smartcart-dev-secret-key-change-in-production-8904
       ADMIN_EMAIL: admin@smartcart.com
       ADMIN_PASSWORD: Admin@12345
       ADMIN_FULL_NAME: SmartCart Admin

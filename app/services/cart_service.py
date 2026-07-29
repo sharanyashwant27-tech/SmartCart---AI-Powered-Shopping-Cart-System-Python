@@ -27,7 +27,7 @@ from app.schemas.cart import (
     CouponUpdate,
     WishlistItemResponse,
 )
-from app.schemas.product import ProductResponse
+from app.schemas.product import CartProductSummary, ProductResponse
 
 settings = get_settings()
 MONEY = Decimal("0.01")
@@ -193,7 +193,7 @@ class CartService:
             product_id=item.product_id,
             quantity=item.quantity,
             status=item.status,
-            product=ProductResponse.model_validate(item.product),
+            product=CartProductSummary.model_validate(item.product),
             line_total=line,
             created_at=item.created_at,
         )
@@ -202,9 +202,9 @@ class CartService:
         self, user_id: int, coupon_code: Optional[str] = None
     ) -> CartSummary:
         active = self.cart.get_user_items(user_id, CartItemStatus.ACTIVE)
-        saved = self.cart.get_user_items(user_id, CartItemStatus.SAVED_FOR_LATER)
+        # Skip saved-for-later query on the hot cart path (SPA does not render it)
         active_resp = [self._to_response(i) for i in active]
-        saved_resp = [self._to_response(i) for i in saved]
+        saved_resp: list[CartItemResponse] = []
         subtotal = _money(sum((i.line_total for i in active_resp), Decimal("0")))
         discount = Decimal("0.00")
         applied = None

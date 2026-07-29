@@ -8,6 +8,7 @@ from app.analytics.router import router as analytics_router
 from app.auth.router import router as auth_router
 from app.cart.router import coupons_router, router as cart_router
 from app.checkout.router import router as checkout_router
+from app.loyalty.router import router as loyalty_router
 from app.orders.router import router as orders_router
 from app.payment.router import router as payment_router
 from app.products.catalog_router import brands_router, categories_router
@@ -21,6 +22,7 @@ api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth_router)
 api_router.include_router(users_router)
 api_router.include_router(addresses_router)
+api_router.include_router(loyalty_router)
 api_router.include_router(categories_router)
 api_router.include_router(brands_router)
 api_router.include_router(products_router)

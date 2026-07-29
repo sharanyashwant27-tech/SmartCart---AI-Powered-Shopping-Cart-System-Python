@@ -4,6 +4,7 @@ from app.models.address import Address, PasswordResetToken
 from app.models.cart import CartItem, WishlistItem
 from app.models.category import Brand, Category
 from app.models.coupon import Coupon
+from app.models.loyalty import LoyaltyTransaction
 from app.models.order import Order, OrderItem, Payment
 from app.models.product import Product
 from app.models.review import ProductImage, Review
@@ -21,6 +22,7 @@ __all__ = [
     "CartItem",
     "WishlistItem",
     "Coupon",
+    "LoyaltyTransaction",
     "Order",
     "OrderItem",
     "Payment",

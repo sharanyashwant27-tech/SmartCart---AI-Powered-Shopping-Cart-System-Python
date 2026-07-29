@@ -63,9 +63,6 @@ class ProductRepository(BaseRepository[Product]):
         skip: int = 0,
         limit: int = 20,
     ) -> tuple[list[Product], int]:
-        query = self.db.query(Product).options(
-            joinedload(Product.category), joinedload(Product.brand)
-        )
         filters = []
         if active_only:
             filters.append(Product.is_active.is_(True))
@@ -84,9 +81,16 @@ class ProductRepository(BaseRepository[Product]):
             filters.append(Product.brand_id == brand_id)
         if featured is not None:
             filters.append(Product.is_featured.is_(featured))
+
+        # Count without joinedloads (much cheaper on SQLite/Postgres)
+        count_q = self.db.query(Product)
+        for f in filters:
+            count_q = count_q.filter(f)
+        total = count_q.count()
+
+        query = self.db.query(Product).options(joinedload(Product.category))
         for f in filters:
             query = query.filter(f)
-        total = query.count()
         items = query.order_by(Product.created_at.desc()).offset(skip).limit(limit).all()
         return items, total
 

@@ -5,10 +5,12 @@ from decimal import Decimal
 
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
@@ -43,6 +45,13 @@ def seed_data() -> None:
         UserService(db).ensure_admin(
             settings.admin_email, settings.admin_password, settings.admin_full_name
         )
+
+        # Fast path: DB already seeded — skip heavy catalog/coupon upserts on every restart
+        from app.models.product import Product
+
+        if db.query(Product.id).limit(1).first() is not None:
+            logger.info("Seed skipped — catalog already present")
+            return
 
         # Categories
         existing_cats = {
@@ -402,6 +411,7 @@ def create_app() -> FastAPI:
     )
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_middleware(GZipMiddleware, minimum_size=500)
     app.add_middleware(SlowAPIMiddleware)
     app.add_middleware(
         CORSMiddleware,
@@ -416,24 +426,53 @@ def create_app() -> FastAPI:
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
     UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Cache the thin HTML shell (assets stay as /static/* so browsers can cache them)
+    _html_cache: dict[str, str] = {"body": "", "mtime": ""}
+
+    def _asset_version() -> str:
+        stamps = []
+        for name in ("app.css", "app.js", "i18n.js"):
+            p = STATIC_DIR / name
+            if p.exists():
+                stamps.append(str(int(p.stat().st_mtime)))
+        return "-".join(stamps) or "1"
+
     def _storefront_html() -> str:
-        """Build a self-contained storefront page (CSS/JS inlined)."""
+        """Serve a lean HTML shell that loads cached CSS/JS (no per-request inlining)."""
+        ver = _asset_version()
+        if _html_cache["body"] and _html_cache["mtime"] == ver:
+            return _html_cache["body"]
         html = (TEMPLATES_DIR / "index.html").read_text(encoding="utf-8")
-        css_path = STATIC_DIR / "app.css"
-        js_path = STATIC_DIR / "app.js"
-        if css_path.exists():
-            css = css_path.read_text(encoding="utf-8")
-            html = html.replace(
-                '<link rel="stylesheet" href="/static/app.css" />',
-                f"<style>\n{css}\n</style>",
-            )
-        if js_path.exists():
-            js = js_path.read_text(encoding="utf-8")
-            html = html.replace(
-                '<script src="/static/app.js"></script>',
-                f"<script>\n{js}\n</script>",
-            )
-        return html.replace("{{PORT}}", str(settings.api_port))
+        html = html.replace("{{PORT}}", str(settings.api_port))
+        # Cache-bust when static files change
+        html = html.replace("/static/app.css", f"/static/app.css?v={ver}")
+        html = html.replace("/static/i18n.js", f"/static/i18n.js?v={ver}")
+        html = html.replace("/static/app.js", f"/static/app.js?v={ver}")
+        _html_cache["body"] = html
+        _html_cache["mtime"] = ver
+        return html
+
+    class StaticCacheMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            response: Response = await call_next(request)
+            path = request.url.path
+            if path.startswith("/static/") or path.startswith("/uploads/"):
+                # Long cache for versioned static assets; short for uploads
+                if path.startswith("/static/"):
+                    response.headers.setdefault(
+                        "Cache-Control", "public, max-age=604800, immutable"
+                    )
+                else:
+                    response.headers.setdefault("Cache-Control", "public, max-age=3600")
+            elif path in {"/", "/app"}:
+                response.headers.setdefault(
+                    "Cache-Control", "no-cache, must-revalidate"
+                )
+            elif path.startswith("/api/"):
+                response.headers.setdefault("Cache-Control", "no-store")
+            return response
+
+    app.add_middleware(StaticCacheMiddleware)
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def root():

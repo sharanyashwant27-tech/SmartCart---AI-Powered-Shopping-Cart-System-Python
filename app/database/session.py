@@ -59,3 +59,38 @@ def init_db() -> None:
     from app import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+    _ensure_loyalty_columns()
+
+
+def _ensure_loyalty_columns() -> None:
+    """SQLite-friendly patches for existing databases (create_all won't ALTER)."""
+    from sqlalchemy import inspect, text
+
+    insp = inspect(engine)
+    tables = set(insp.get_table_names())
+    with engine.begin() as conn:
+        if "users" in tables:
+            cols = {c["name"] for c in insp.get_columns("users")}
+            if "loyalty_points" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE users ADD COLUMN loyalty_points "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+                )
+        if "orders" in tables:
+            cols = {c["name"] for c in insp.get_columns("orders")}
+            if "points_earned" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE orders ADD COLUMN points_earned "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+                )
+            if "points_redeemed" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE orders ADD COLUMN points_redeemed "
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+                )

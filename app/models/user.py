@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Enum, String, func
+from sqlalchemy import Boolean, DateTime, Enum, Integer, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship, synonym
 
 from app.database import Base
@@ -14,7 +14,7 @@ class User(Base):
     """
     Users
     -----
-    id, name, email, password, phone, role, created_at
+    id, name, email, password, phone, role, created_at, loyalty_points
     """
 
     __tablename__ = "users"
@@ -31,6 +31,9 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+    # Guest (customer) loyalty balance
+    loyalty_points: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     # Extended profile / ops fields (beyond the core design)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -61,6 +64,9 @@ class User(Base):
         "PasswordResetToken", back_populates="user", cascade="all, delete-orphan"
     )
     reviews = relationship("Review", back_populates="user", cascade="all, delete-orphan")
+    loyalty_transactions = relationship(
+        "LoyaltyTransaction", back_populates="user", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return f"<User id={self.id} email={self.email!r} role={self.role}>"

@@ -24,6 +24,8 @@ slowapi==0.1.9
 
 # Payments
 stripe==11.3.0
+qrcode[pil]==8.0
+Pillow==11.1.0
 
 # AI (optional — leave OPENAI_API_KEY empty to disable)
 openai==1.58.1

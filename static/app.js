@@ -18,14 +18,21 @@ const state = {
   refresh: localStorage.getItem("sc_refresh") || "",
   user: readUser(),
   products: [],
+  productsCacheKey: "",
+  productsFetchedAt: 0,
   categories: [],
+  categoriesLoaded: false,
   cart: null,
+  cartFetchedAt: 0,
   cartCount: Number(localStorage.getItem("sc_cart_count") || 0),
   couponCode: localStorage.getItem("sc_coupon") || "",
   pendingPayment: null,
   lastOrder: null,
   dash: null,
   productId: null,
+  authValidatedAt: 0,
+  checkoutDraft: null,
+  navSeq: 0,
 };
 
 function setCoupon(code) {
@@ -52,6 +59,7 @@ async function refreshCartSummary() {
   try {
     const cart = await api("GET", "/cart");
     state.cart = cart;
+    state.cartFetchedAt = Date.now();
     setCartCount(cart.item_count || (cart.items || []).length || 0);
     return cart;
   } catch {
@@ -64,9 +72,27 @@ function money(v) {
   return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+/** Prefer smaller Unsplash thumbs so shop/cart LCP is not blocked by 600px remote images */
+function thumbUrl(url) {
+  if (!url) return "";
+  try {
+    const u = new URL(url, window.location.origin);
+    if (u.hostname.includes("images.unsplash.com") || u.hostname.includes("unsplash.com")) {
+      u.searchParams.set("w", "400");
+      u.searchParams.set("q", "55");
+      u.searchParams.set("auto", "format");
+      u.searchParams.set("fit", "crop");
+      return u.toString();
+    }
+  } catch {
+    /* keep original */
+  }
+  return url;
+}
+
 async function downloadBill(orderId, orderNumber) {
   if (!state.token) {
-    toast("Sign in to download bill", "error");
+    toast(t("bill.signin"), "error");
     return;
   }
   try {
@@ -75,8 +101,8 @@ async function downloadBill(orderId, orderNumber) {
       headers: { Authorization: `Bearer ${state.token}` },
     });
     if (!res.ok) {
-      const t = await res.text();
-      throw new Error(t || "Could not download bill");
+      const bodyText = await res.text();
+      throw new Error(bodyText || t("bill.fail"));
     }
     const blob = await res.blob();
     const a = document.createElement("a");
@@ -86,19 +112,13 @@ async function downloadBill(orderId, orderNumber) {
     a.click();
     a.remove();
     URL.revokeObjectURL(a.href);
-    toast("Bill downloaded");
+    toast(t("bill.ok"));
   } catch (e) {
     toast(e.message, "error");
   }
 }
 
-const PAY_METHODS = [
-  { id: "card", label: "Card", hint: "Debit / credit card" },
-  { id: "upi", label: "UPI", hint: "GPay, PhonePe, BHIM" },
-  { id: "netbanking", label: "Net Banking", hint: "Internet banking" },
-  { id: "wallet", label: "Wallet", hint: "Paytm / Amazon Pay" },
-  { id: "cod", label: "Cash on Delivery", hint: "Pay when delivered" },
-];
+function PAY_METHODS() { return payMethods(); }
 
 
 function toast(msg, type = "ok") {
@@ -113,10 +133,24 @@ function saveAuth(data) {
   state.token = data.access_token;
   state.refresh = data.refresh_token || "";
   state.user = data.user;
+  state.authValidatedAt = Date.now();
   localStorage.setItem("sc_token", state.token);
   localStorage.setItem("sc_refresh", state.refresh);
   localStorage.setItem("sc_user", JSON.stringify(state.user));
   renderChrome();
+}
+
+async function refreshUserProfile() {
+  if (!state.token) return null;
+  try {
+    const user = await api("GET", "/users/me");
+    state.user = user;
+    localStorage.setItem("sc_user", JSON.stringify(user));
+    renderChrome();
+    return user;
+  } catch {
+    return null;
+  }
 }
 
 function clearAuth() {
@@ -125,6 +159,7 @@ function clearAuth() {
   state.user = null;
   state.cart = null;
   state.pendingPayment = null;
+  state.authValidatedAt = 0;
   localStorage.removeItem("sc_token");
   localStorage.removeItem("sc_refresh");
   localStorage.removeItem("sc_user");
@@ -136,7 +171,93 @@ function isAdmin() {
   return state.user && (state.user.role === "admin" || state.user.role === "Admin");
 }
 
-async function api(method, path, body, params) {
+let _refreshInFlight = null;
+
+async function refreshAccessToken() {
+  if (!state.refresh) return false;
+  if (_refreshInFlight) return _refreshInFlight;
+  _refreshInFlight = (async () => {
+    try {
+      const res = await fetch(`${API}/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: state.refresh }),
+      });
+      const text = await res.text();
+      let data = null;
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch {
+          data = null;
+        }
+      }
+      if (!res.ok) return false;
+      saveAuth(data);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      _refreshInFlight = null;
+    }
+  })();
+  return _refreshInFlight;
+}
+
+async function ensureAuthSession(force = false) {
+  if (!state.token) return false;
+  const fresh = Date.now() - (state.authValidatedAt || 0) < 60000;
+  if (!force && fresh && state.user) return true;
+  try {
+    const user = await api("GET", "/auth/validate", null, null, { skipAuthRetry: true });
+    state.user = user;
+    state.authValidatedAt = Date.now();
+    localStorage.setItem("sc_user", JSON.stringify(user));
+    renderChrome();
+    return true;
+  } catch {
+    const ok = await refreshAccessToken();
+    if (!ok) {
+      clearAuth();
+      state.authValidatedAt = 0;
+      return false;
+    }
+    try {
+      const user = await api("GET", "/auth/validate", null, null, { skipAuthRetry: true });
+      state.user = user;
+      state.authValidatedAt = Date.now();
+      localStorage.setItem("sc_user", JSON.stringify(user));
+      renderChrome();
+      return true;
+    } catch {
+      clearAuth();
+      state.authValidatedAt = 0;
+      return false;
+    }
+  }
+}
+
+function parseApiError(data, status) {
+  let detail = `Request failed (${status})`;
+  if (data) {
+    const errs = data.error?.extra?.errors;
+    if (Array.isArray(errs) && errs.length) {
+      detail = errs.map((d) => d.msg || JSON.stringify(d)).join("; ");
+    } else if (data.error && data.error.detail) {
+      detail = data.error.detail;
+    } else if (typeof data.detail === "string") {
+      detail = data.detail;
+    } else if (Array.isArray(data.detail)) {
+      detail = data.detail.map((d) => d.msg || JSON.stringify(d)).join("; ");
+    } else if (data.message) {
+      detail = data.message;
+    }
+  }
+  return typeof detail === "string" ? detail : JSON.stringify(detail);
+}
+
+async function api(method, path, body, params, opts) {
+  const options = opts || {};
   const url = new URL(API + path, window.location.origin);
   if (params) {
     Object.entries(params).forEach(([k, v]) => {
@@ -153,25 +274,31 @@ async function api(method, path, body, params) {
   let data = null;
   const text = await res.text();
   if (text) {
-    try { data = JSON.parse(text); } catch { data = { detail: text }; }
-  }
-  if (!res.ok) {
-    let detail = `Request failed (${res.status})`;
-    if (data) {
-      const errs = data.error?.extra?.errors;
-      if (Array.isArray(errs) && errs.length) {
-        detail = errs.map((d) => d.msg || JSON.stringify(d)).join("; ");
-      } else if (data.error && data.error.detail) {
-        detail = data.error.detail;
-      } else if (typeof data.detail === "string") {
-        detail = data.detail;
-      } else if (Array.isArray(data.detail)) {
-        detail = data.detail.map((d) => d.msg || JSON.stringify(d)).join("; ");
-      } else if (data.message) {
-        detail = data.message;
-      }
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { detail: text };
     }
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+
+  if (res.status === 401 && !options.skipAuthRetry && !path.startsWith("/auth/login") && !path.startsWith("/auth/register") && !path.startsWith("/auth/refresh")) {
+    const refreshed = await refreshAccessToken();
+    if (refreshed) {
+      return api(method, path, body, params, { ...options, skipAuthRetry: true });
+    }
+    clearAuth();
+    const detail = parseApiError(data, res.status);
+    const err = new Error(detail || t("auth.sessionExpired"));
+    err.status = 401;
+    err.authFailed = true;
+    throw err;
+  }
+
+  if (!res.ok) {
+    const detail = parseApiError(data, res.status);
+    const err = new Error(detail);
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
@@ -180,26 +307,32 @@ function renderChrome() {
   const box = document.getElementById("user-box");
   const navAccount = document.getElementById("nav-account");
   if (navAccount) {
-    navAccount.textContent = state.user ? "My Account" : "Login";
+    navAccount.textContent = state.user ? t("nav.account") : t("nav.login");
   }
   if (state.user) {
-    const name = state.user.name || state.user.full_name || "User";
+    const name = state.user.name || state.user.full_name || t("user.user");
     const role = (state.user.role || "customer").toLowerCase();
+    const pts = Number(state.user.loyalty_points || 0);
+    const loyaltyChip =
+      role === "customer"
+        ? `<span class="loyalty-chip">${pts} ${t("loyalty.pts")}</span>`
+        : "";
     box.innerHTML = `
       <div><strong>${escapeHtml(name)}</strong></div>
       <div class="email">${escapeHtml(state.user.email || "")}</div>
-      <span class="role-pill ${role === "admin" ? "admin" : "customer"}">${escapeHtml(role)}</span>
-      <button class="nav-btn" style="margin-top:0.6rem" id="btn-logout">Logout</button>
+      <span class="role-pill ${role === "admin" ? "admin" : "customer"}">${escapeHtml(tRole(role))}</span>
+      ${loyaltyChip}
+      <button class="nav-btn" style="margin-top:0.6rem" id="btn-logout">${t("user.logout")}</button>
     `;
     document.getElementById("btn-logout").onclick = () => {
       clearAuth();
-      toast("Logged out");
+      toast(t("account.loggedOut"));
       navigate("account");
     };
   } else {
     box.innerHTML = `
-      <div class="email">Browsing as guest</div>
-      <button class="nav-btn" style="margin-top:0.6rem" id="btn-goto-login">Login / Register</button>
+      <div class="email">${t("user.guest")}</div>
+      <button class="nav-btn" style="margin-top:0.6rem" id="btn-goto-login">${t("user.loginRegister")}</button>
     `;
     document.getElementById("btn-goto-login").onclick = () => navigate("account");
   }
@@ -209,6 +342,7 @@ function renderChrome() {
   document.querySelectorAll(".nav-btn[data-page]").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.page === state.page);
   });
+  if (typeof applyStaticI18n === "function") applyStaticI18n();
 }
 
 function escapeHtml(s) {
@@ -222,6 +356,7 @@ function escapeHtml(s) {
 function navigate(page, extra) {
   state.page = page;
   if (extra && extra.productId) state.productId = extra.productId;
+  state.navSeq = (state.navSeq || 0) + 1;
   renderChrome();
   const views = {
     shop: viewShop,
@@ -238,39 +373,63 @@ function navigate(page, extra) {
   (views[page] || viewShop)();
 }
 
+function productCardHtml(p) {
+  return `
+        <article class="card">
+          ${
+            p.image_url || p.image
+              ? `<img src="${escapeHtml(thumbUrl(p.image_url || p.image))}" alt="" loading="lazy" decoding="async" width="400" height="240" />`
+              : ""
+          }
+          ${p.is_featured ? `<span class="badge">${t("shop.featured")}</span>` : ""}
+          <h3>${escapeHtml(p.name)}</h3>
+          <div class="muted">${escapeHtml(tCat((p.category && p.category.name) || ""))}</div>
+          <div class="price">${money(p.price)}</div>
+          <div class="muted">${t("shop.stock")}: ${p.stock_quantity ?? p.stock ?? 0}</div>
+          <div class="btn-row">
+            <button class="btn btn-ghost" data-view="${p.id}">${t("shop.details")}</button>
+            <button class="btn btn-primary" data-add="${p.id}">${t("shop.add")}</button>
+          </div>
+        </article>`;
+}
+
+function bindProductGrid(grid) {
+  if (!grid) return;
+  grid.querySelectorAll("[data-view]").forEach((b) =>
+    b.addEventListener("click", () => navigate("product", { productId: Number(b.dataset.view) }))
+  );
+  grid.querySelectorAll("[data-add]").forEach((b) =>
+    b.addEventListener("click", () => addToCart(Number(b.dataset.add)))
+  );
+}
+
 async function viewShop() {
   const root = document.getElementById("app");
+  const seq = state.navSeq;
   root.innerHTML = `
     <div class="hero">
-      <h1 class="brand-title" id="hero-home" title="Go to shop" role="link" tabindex="0">SmartCart</h1>
-      <p>Curated products · Fast checkout · Transparent totals</p>
+      <h1 class="brand-title" id="hero-home" title="${t("brand.goShop")}" role="link" tabindex="0">SmartCart</h1>
+      <p>${t("shop.tagline")}</p>
       <div class="links-row">
-        <a href="/docs">API Docs</a>
-        <a href="/health">Health</a>
+        <a href="/docs">${t("shop.docs")}</a>
+        <a href="/health">${t("shop.health")}</a>
       </div>
     </div>
     <div class="toolbar">
-      <label>Search<input id="q" placeholder="Headphones, jacket…" /></label>
-      <label>Category
-        <select id="cat"><option value="">All</option></select>
+      <label>${t("shop.search")}<input id="q" placeholder="${t("shop.searchPh")}" /></label>
+      <label>${t("shop.category")}
+        <select id="cat"><option value="">${t("shop.all")}</option></select>
       </label>
-      <label>&nbsp;<button class="btn btn-primary" id="btn-search">Search</button></label>
+      <label>&nbsp;<button class="btn btn-primary" id="btn-search">${t("shop.search")}</button></label>
     </div>
-    <div id="product-grid" class="grid"><div class="muted">Loading…</div></div>
+    <div id="product-grid" class="grid">${
+      state.products.length && !state.productsCacheKey
+        ? state.products.map(productCardHtml).join("")
+        : state.products.length && state.productsCacheKey === "|"
+          ? state.products.map(productCardHtml).join("")
+          : `<div class="muted">${t("shop.loading")}</div>`
+    }</div>
   `;
-
-  try {
-    state.categories = await api("GET", "/categories", null, { active_only: true });
-    const cat = document.getElementById("cat");
-    state.categories.forEach((c) => {
-      const opt = document.createElement("option");
-      opt.value = c.id;
-      opt.textContent = c.name;
-      cat.appendChild(opt);
-    });
-  } catch (e) {
-    toast(e.message, "error");
-  }
 
   const heroHome = document.getElementById("hero-home");
   if (heroHome) {
@@ -284,9 +443,58 @@ async function viewShop() {
     });
   }
 
-  async function load() {
-    const q = document.getElementById("q").value.trim();
-    const category_id = document.getElementById("cat").value;
+  // Paint cached default shop grid immediately
+  const gridEl = document.getElementById("product-grid");
+  if (state.products.length && (!state.productsCacheKey || state.productsCacheKey === "|")) {
+    bindProductGrid(gridEl);
+  }
+
+  function fillCategories() {
+    const cat = document.getElementById("cat");
+    if (!cat || !state.categories) return;
+    const current = cat.value;
+    cat.innerHTML = `<option value="">${t("shop.all")}</option>`;
+    state.categories.forEach((c) => {
+      const opt = document.createElement("option");
+      opt.value = c.id;
+      opt.textContent = tCat(c.name);
+      cat.appendChild(opt);
+    });
+    if (current) cat.value = current;
+  }
+
+  function renderProducts(items) {
+    const grid = document.getElementById("product-grid");
+    if (!grid || seq !== state.navSeq) return;
+    if (!items.length) {
+      grid.innerHTML = `<div class="muted">${t("shop.empty")}</div>`;
+      return;
+    }
+    grid.innerHTML = items.map(productCardHtml).join("");
+    bindProductGrid(grid);
+  }
+
+  async function load(force = false) {
+    if (seq !== state.navSeq) return;
+    const q = document.getElementById("q")?.value.trim() || "";
+    const category_id = document.getElementById("cat")?.value || "";
+    const cacheKey = `${q}|${category_id}`;
+    const fresh =
+      !force &&
+      state.productsCacheKey === cacheKey &&
+      state.products.length &&
+      Date.now() - (state.productsFetchedAt || 0) < 60000;
+
+    if (fresh) {
+      renderProducts(state.products);
+      return;
+    }
+
+    // Instant paint from stale cache for same filters
+    if (state.productsCacheKey === cacheKey && state.products.length) {
+      renderProducts(state.products);
+    }
+
     try {
       const data = await api("GET", "/products", null, {
         page: 1,
@@ -295,69 +503,72 @@ async function viewShop() {
         q: q || undefined,
         category_id: category_id || undefined,
       });
+      if (seq !== state.navSeq) return;
       state.products = data.items || [];
-      const grid = document.getElementById("product-grid");
-      if (!state.products.length) {
-        grid.innerHTML = `<div class="muted">No products found.</div>`;
-        return;
-      }
-      grid.innerHTML = state.products
-        .map(
-          (p) => `
-        <article class="card">
-          ${p.image_url || p.image ? `<img src="${escapeHtml(p.image_url || p.image)}" alt="" />` : ""}
-          ${p.is_featured ? `<span class="badge">Featured</span>` : ""}
-          <h3>${escapeHtml(p.name)}</h3>
-          <div class="muted">${escapeHtml((p.category && p.category.name) || "General")}</div>
-          <div class="price">${money(p.price)}</div>
-          <div class="muted">Stock: ${p.stock_quantity ?? p.stock ?? 0}</div>
-          <div class="btn-row">
-            <button class="btn btn-ghost" data-view="${p.id}">Details</button>
-            <button class="btn btn-primary" data-add="${p.id}">Add</button>
-          </div>
-        </article>`
-        )
-        .join("");
-      grid.querySelectorAll("[data-view]").forEach((b) =>
-        b.addEventListener("click", () => navigate("product", { productId: Number(b.dataset.view) }))
-      );
-      grid.querySelectorAll("[data-add]").forEach((b) =>
-        b.addEventListener("click", () => addToCart(Number(b.dataset.add)))
-      );
+      state.productsCacheKey = cacheKey;
+      state.productsFetchedAt = Date.now();
+      renderProducts(state.products);
     } catch (e) {
-      toast(e.message, "error");
+      if (seq === state.navSeq) toast(e.message, "error");
     }
   }
 
-  document.getElementById("btn-search").onclick = load;
-  document.getElementById("q").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") load();
+  // Load categories + products in parallel (reuse cached categories)
+  try {
+    const tasks = [load()];
+    if (!state.categoriesLoaded) {
+      tasks.push(
+        api("GET", "/categories", null, { active_only: true }).then((cats) => {
+          state.categories = cats || [];
+          state.categoriesLoaded = true;
+          if (seq === state.navSeq) fillCategories();
+        })
+      );
+    } else {
+      fillCategories();
+    }
+    await Promise.all(tasks);
+  } catch (e) {
+    toast(e.message, "error");
+  }
+
+  let searchTimer = null;
+  document.getElementById("btn-search").onclick = () => load(true);
+  document.getElementById("cat").addEventListener("change", () => load(true));
+  document.getElementById("q").addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => load(true), 280);
   });
-  await load();
+  document.getElementById("q").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      clearTimeout(searchTimer);
+      load(true);
+    }
+  });
 }
 
 async function viewProduct() {
   const root = document.getElementById("app");
-  root.innerHTML = `<div class="muted">Loading product…</div>`;
+  root.innerHTML = `<div class="muted">${t("product.loading")}</div>`;
   try {
     const p = await api("GET", `/products/${state.productId}`);
     root.innerHTML = `
-      <button class="btn btn-ghost" id="back">← Back to shop</button>
+      <button class="btn btn-ghost" id="back">${t("product.back")}</button>
       <div class="panel" style="margin-top:1rem;display:grid;grid-template-columns:1fr 1fr;gap:1.25rem">
         <div>
-          ${p.image_url || p.image ? `<img src="${escapeHtml(p.image_url || p.image)}" style="width:100%;border-radius:14px" alt="" />` : ""}
+          ${p.image_url || p.image ? `<img src="${escapeHtml(p.image_url || p.image)}" style="width:100%;border-radius:14px" alt="" loading="lazy" decoding="async" />` : ""}
         </div>
         <div>
-          <h2 style="font-family:Sora,sans-serif;font-size:1.8rem;letter-spacing:-0.03em">${escapeHtml(p.name)}</h2>
+          <h2 style="font-family:Outfit,system-ui,sans-serif;font-size:1.8rem;letter-spacing:-0.03em">${escapeHtml(p.name)}</h2>
           <div class="price" style="margin:0.5rem 0">${money(p.price)}</div>
           <p class="muted" style="margin-bottom:1rem">${escapeHtml(p.description || "No description.")}</p>
           <div class="field">
-            <label>Quantity</label>
+            <label>${t("product.qty")}</label>
             <input type="number" id="qty" min="1" max="50" value="1" />
           </div>
           <div class="btn-row">
-            <button class="btn btn-primary" id="add">Add to Cart</button>
-            <button class="btn btn-ghost" id="wish">Wishlist</button>
+            <button class="btn btn-primary" id="add">${t("product.addCart")}</button>
+            <button class="btn btn-ghost" id="wish">${t("product.wishlist")}</button>
           </div>
         </div>
       </div>`;
@@ -365,10 +576,10 @@ async function viewProduct() {
     document.getElementById("add").onclick = () =>
       addToCart(p.id, Number(document.getElementById("qty").value || 1));
     document.getElementById("wish").onclick = async () => {
-      if (!state.token) return toast("Sign in required", "error");
+      if (!state.token) return toast(t("product.signIn"), "error");
       try {
         await api("POST", "/wishlist", { product_id: p.id });
-        toast("Added to wishlist");
+        toast(t("product.wishlistOk"));
       } catch (e) {
         toast(e.message, "error");
       }
@@ -381,15 +592,21 @@ async function viewProduct() {
 
 async function addToCart(productId, quantity = 1) {
   if (!state.token) {
-    toast("Please sign in to add items", "error");
+    toast(t("product.signInAdd"), "error");
     navigate("account");
     return;
   }
+  // Trust JWT; api() retries on 401 — skip extra /auth/validate round-trip
   try {
     await api("POST", "/cart/items", { product_id: productId, quantity });
     await refreshCartSummary();
-    toast("Added to cart");
+    toast(t("product.addOk"));
   } catch (e) {
+    if (e.authFailed || e.status === 401) {
+      toast(t("auth.sessionExpired"), "error");
+      navigate("account");
+      return;
+    }
     toast(e.message, "error");
   }
 }
@@ -397,7 +614,7 @@ async function addToCart(productId, quantity = 1) {
 async function viewCart() {
   const root = document.getElementById("app");
   if (!state.token) {
-    root.innerHTML = `<div class="panel"><p>Please <a href="#" id="go-account" style="color:var(--teal-deep);font-weight:700">sign in</a> to view your cart.</p></div>`;
+    root.innerHTML = `<div class="panel"><p>${t("cart.signinBefore")}<a href="#" id="go-account" style="color:var(--teal-deep);font-weight:700">${t("cart.signinLink")}</a>${t("cart.signinAfter")}</p></div>`;
     document.getElementById("go-account").onclick = (e) => {
       e.preventDefault();
       navigate("account");
@@ -406,20 +623,31 @@ async function viewCart() {
   }
   root.innerHTML = `
     <div class="hero">
-      <h1>Your Cart</h1>
-      <p>Update quantities, apply coupons, then checkout</p>
+      <h1>${t("cart.title")}</h1>
+      <p>${t("cart.sub")}</p>
     </div>
-    <div id="cart-body" class="panel">Loading…</div>`;
-  try {
-    const cart = await api("GET", "/cart");
-    state.cart = cart;
-    setCartCount(cart.item_count || (cart.items || []).length || 0);
+    <div id="cart-body" class="panel">${
+      state.cart?.items?.length ? "" : t("common.loading")
+    }</div>`;
+
+  async function setItemQuantity(itemId, quantity) {
+    const id = Number(itemId);
+    if (quantity < 1) {
+      await api("DELETE", `/cart/items/${id}`);
+      toast(t("cart.removed"));
+      return;
+    }
+    await api("PATCH", `/cart/items/${id}`, { quantity });
+  }
+
+  const renderCartBody = (cart) => {
     const body = document.getElementById("cart-body");
+    if (!body) return;
     const items = cart.items || [];
     if (!items.length) {
       body.innerHTML = `
-        <p class="muted">Cart is empty.</p>
-        <button class="btn btn-primary" id="shop">Continue shopping</button>`;
+        <p class="muted">${t("cart.empty")}</p>
+        <button class="btn btn-primary" id="shop">${t("cart.continue")}</button>`;
       document.getElementById("shop").onclick = () => navigate("shop");
       return;
     }
@@ -428,96 +656,132 @@ async function viewCart() {
       ${items
         .map(
           (it) => `
-        <div class="cart-item">
-          <img src="${escapeHtml(it.product?.image_url || it.product?.image || "")}" alt="" />
+        <div class="cart-item" data-item-id="${it.id}">
+          <img src="${escapeHtml(thumbUrl(it.product?.image_url || it.product?.image || ""))}" alt="" loading="lazy" decoding="async" />
           <div>
             <strong>${escapeHtml(it.product?.name || "Item")}</strong>
-            <div class="muted">${money(it.product?.price)} each</div>
-            <div class="qty-row">
-              <button class="btn btn-ghost qty-btn" data-dec="${it.id}">−</button>
-              <span class="qty-val">${it.quantity}</span>
-              <button class="btn btn-ghost qty-btn" data-inc="${it.id}" data-q="${it.quantity}">+</button>
+            <div class="muted">${money(it.product?.price)} ${t("cart.each")}</div>
+            <div class="qty-row" role="group" aria-label="${t("cart.qty")}">
+              <button type="button" class="btn qty-btn" data-dec="${it.id}" aria-label="${t("cart.qtyMinus")}" title="${t("cart.qtyMinus")}">−</button>
+              <input class="qty-input" type="number" min="1" max="99" value="${it.quantity}" data-qty="${it.id}" aria-label="${t("cart.qty")}" />
+              <button type="button" class="btn qty-btn" data-inc="${it.id}" aria-label="${t("cart.qtyPlus")}" title="${t("cart.qtyPlus")}">+</button>
             </div>
           </div>
           <div style="text-align:right">
             <div class="price">${money(it.line_total)}</div>
-            <button class="btn btn-danger" data-rm="${it.id}" style="margin-top:0.35rem">Remove</button>
+            <button type="button" class="btn btn-danger" data-rm="${it.id}" style="margin-top:0.35rem">${t("cart.remove")}</button>
           </div>
         </div>`
         )
         .join("")}
       <div class="totals">
-        <div class="row"><span>Subtotal</span><span>${money(cart.subtotal)}</span></div>
-        <div class="row"><span>Discount</span><span>-${money(cart.discount_amount)}</span></div>
-        <div class="row"><span>Shipping</span><span>${money(cart.shipping_amount)}</span></div>
-        <div class="row"><span>Tax</span><span>${money(cart.tax_amount)}</span></div>
-        <div class="row grand"><span>Total</span><span>${money(cart.total)}</span></div>
+        <div class="row"><span>${t("cart.subtotal")}</span><span>${money(cart.subtotal)}</span></div>
+        <div class="row"><span>${t("cart.discount")}</span><span>-${money(cart.discount_amount)}</span></div>
+        <div class="row"><span>${t("cart.shipping")}</span><span>${money(cart.shipping_amount)}</span></div>
+        <div class="row"><span>${t("cart.tax")}</span><span>${money(cart.tax_amount)}</span></div>
+        <div class="row grand"><span>${t("cart.total")}</span><span>${money(cart.total)}</span></div>
       </div>
       <div class="field" style="margin-top:1rem">
-        <label>Coupon code</label>
+        <label>${t("cart.coupon")}</label>
         <div style="display:flex;gap:0.5rem;flex-wrap:wrap">
           <input id="coupon" placeholder="WELCOME10 or SAVE5" value="${couponVal}" style="flex:1" />
-          <button class="btn btn-ghost" id="apply-coupon">Apply</button>
+          <button class="btn btn-ghost" id="apply-coupon">${t("cart.apply")}</button>
         </div>
-        <p class="muted" style="margin-top:0.35rem">Try <code>WELCOME10</code> (10%) or <code>SAVE5</code> ($5 off)</p>
+        <p class="muted" style="margin-top:0.35rem">${t("cart.couponHint")}</p>
       </div>
-      <button class="btn btn-primary btn-block" id="to-checkout" style="margin-top:0.75rem">Proceed to checkout</button>
+      <button class="btn btn-primary btn-block" id="to-checkout" style="margin-top:0.75rem">${t("cart.checkout")}</button>
     `;
+
+    const runQtyUpdate = async (itemId, nextQty) => {
+      const controls = body.querySelectorAll("[data-inc], [data-dec], [data-qty], [data-rm]");
+      controls.forEach((el) => {
+        el.disabled = true;
+      });
+      try {
+        await setItemQuantity(itemId, nextQty);
+        const updated = await refreshCartSummary();
+        if (updated) renderCartBody(updated);
+        else viewCart();
+      } catch (e) {
+        toast(e.message, "error");
+        controls.forEach((el) => {
+          el.disabled = false;
+        });
+      }
+    };
 
     body.querySelectorAll("[data-rm]").forEach((b) =>
       b.addEventListener("click", async () => {
         try {
+          b.disabled = true;
           await api("DELETE", `/cart/items/${b.dataset.rm}`);
-          toast("Removed");
-          viewCart();
+          toast(t("cart.removed"));
+          const updated = await refreshCartSummary();
+          if (updated) renderCartBody(updated);
+          else viewCart();
         } catch (e) {
+          b.disabled = false;
           toast(e.message, "error");
         }
       })
     );
+
     body.querySelectorAll("[data-inc]").forEach((b) =>
-      b.addEventListener("click", async () => {
-        const q = Number(b.dataset.q || 1) + 1;
-        try {
-          await api("PATCH", `/cart/items/${b.dataset.inc}`, { quantity: q });
-          viewCart();
-        } catch (e) {
-          toast(e.message, "error");
-        }
+      b.addEventListener("click", () => {
+        const item = items.find((i) => String(i.id) === String(b.dataset.inc));
+        runQtyUpdate(b.dataset.inc, (item?.quantity || 1) + 1);
       })
     );
+
     body.querySelectorAll("[data-dec]").forEach((b) =>
-      b.addEventListener("click", async () => {
+      b.addEventListener("click", () => {
         const item = items.find((i) => String(i.id) === String(b.dataset.dec));
-        const q = Math.max(1, (item?.quantity || 1) - 1);
-        try {
-          if (q === 1 && item?.quantity === 1) {
-            /* keep at 1 */
-          }
-          await api("PATCH", `/cart/items/${b.dataset.dec}`, { quantity: q });
-          viewCart();
-        } catch (e) {
-          toast(e.message, "error");
-        }
+        runQtyUpdate(b.dataset.dec, (item?.quantity || 1) - 1);
       })
     );
+
+    body.querySelectorAll("[data-qty]").forEach((input) =>
+      input.addEventListener("change", () => {
+        const raw = Number(input.value);
+        const q = Number.isFinite(raw) ? Math.floor(raw) : 1;
+        if (q < 1) {
+          runQtyUpdate(input.dataset.qty, 0);
+          return;
+        }
+        runQtyUpdate(input.dataset.qty, Math.min(99, q));
+      })
+    );
+
     document.getElementById("apply-coupon").onclick = async () => {
       const code = document.getElementById("coupon").value.trim();
       if (!code) {
-        toast("Enter a coupon code", "error");
+        toast(t("cart.enterCoupon"), "error");
         return;
       }
       try {
         const updated = await api("POST", "/cart/apply-coupon", { code });
         setCoupon(code);
         state.cart = updated;
-        toast(`Coupon ${code} applied · −${money(updated.discount_amount)}`);
-        viewCart();
+        state.cartFetchedAt = Date.now();
+        toast(t("cart.couponApplied", { code, amount: money(updated.discount_amount) }));
+        renderCartBody(updated);
       } catch (e) {
         toast(e.message, "error");
       }
     };
     document.getElementById("to-checkout").onclick = () => navigate("checkout");
+  };
+
+  if (state.cart?.items) {
+    renderCartBody(state.cart);
+  }
+
+  try {
+    const cart = await api("GET", "/cart");
+    state.cart = cart;
+    state.cartFetchedAt = Date.now();
+    setCartCount(cart.item_count || (cart.items || []).length || 0);
+    renderCartBody(cart);
   } catch (e) {
     toast(e.message, "error");
   }
@@ -531,24 +795,38 @@ async function viewCheckout() {
   }
 
   let cart = state.cart;
-  try {
-    cart = await api("GET", "/cart");
-    state.cart = cart;
-    setCartCount(cart.item_count || 0);
-  } catch (e) {
-    toast(e.message, "error");
-    return;
+  const cartFresh = cart?.items?.length && Date.now() - (state.cartFetchedAt || 0) < 30000;
+  if (!cartFresh) {
+    try {
+      cart = await api("GET", "/cart");
+      state.cart = cart;
+      state.cartFetchedAt = Date.now();
+      setCartCount(cart.item_count || 0);
+    } catch (e) {
+      toast(e.message, "error");
+      return;
+    }
+  } else {
+    // Soft-refresh in background without blocking checkout UI
+    api("GET", "/cart")
+      .then((c) => {
+        state.cart = c;
+        state.cartFetchedAt = Date.now();
+        setCartCount(c.item_count || 0);
+      })
+      .catch(() => {});
   }
 
   if (!cart?.items?.length) {
     root.innerHTML = `
-      <div class="hero"><h1>Checkout</h1><p>Your cart is empty</p></div>
-      <div class="panel"><button class="btn btn-primary" id="shop">Go shopping</button></div>`;
+      <div class="hero"><h1>${t("checkout.title")}</h1><p>${t("checkout.empty")}</p></div>
+      <div class="panel"><button class="btn btn-primary" id="shop">${t("checkout.goShop")}</button></div>`;
     document.getElementById("shop").onclick = () => navigate("shop");
     return;
   }
 
   const user = state.user || {};
+  const draft = state.checkoutDraft || {};
   const defaultAddr = [
     user.address_line1,
     user.address_line2,
@@ -557,38 +835,55 @@ async function viewCheckout() {
   ]
     .filter(Boolean)
     .join(", ");
+  const shipVal = draft.ship != null ? draft.ship : defaultAddr;
+  const billVal = draft.bill != null ? draft.bill : "";
+  const couponVal = draft.coupon != null ? draft.coupon : state.couponCode || "";
+  const notesVal = draft.notes != null ? draft.notes : "";
+  const redeemVal = draft.redeem != null ? draft.redeem : "0";
+  const payMethodVal = draft.payMethod || "card";
+  const billSame = draft.billSame !== false;
 
   root.innerHTML = `
     <div class="hero">
-      <h1>Checkout</h1>
-      <p>Choose payment method · then pay & download bill</p>
+      <h1>${t("checkout.title")}</h1>
+      <p>${t("checkout.sub")}</p>
     </div>
     <div class="checkout-grid">
       <div class="panel">
-        <h2>Shipping</h2>
+        <h2>${t("checkout.shipping")}</h2>
         <div class="field">
-          <label>Shipping address</label>
-          <textarea id="ship" placeholder="123 Main St, City, State, ZIP, Country">${escapeHtml(defaultAddr)}</textarea>
+          <label>${t("checkout.shipAddr")}</label>
+          <textarea id="ship" placeholder="123 Main St, City, State, ZIP, Country">${escapeHtml(shipVal)}</textarea>
+          <p class="muted" style="margin-top:0.35rem;font-size:0.82rem">${t("checkout.addrHint")}</p>
         </div>
         <div class="field">
-          <label>Billing address (optional)</label>
-          <textarea id="bill" placeholder="Same as shipping if blank"></textarea>
+          <label>${t("checkout.billAddr")}</label>
+          <textarea id="bill" placeholder="${t("checkout.billPh")}">${escapeHtml(billVal)}</textarea>
+          <label class="check-row" style="margin-top:0.45rem">
+            <input type="checkbox" id="bill-same" ${billSame ? "checked" : ""} /> ${t("checkout.sameAsShip")}
+          </label>
         </div>
         <div class="field">
-          <label>Coupon code</label>
-          <input id="c_code" placeholder="WELCOME10" value="${escapeHtml(state.couponCode || "")}" />
+          <label>${t("checkout.coupon")}</label>
+          <input id="c_code" placeholder="WELCOME10" value="${escapeHtml(couponVal)}" />
         </div>
         <div class="field">
-          <label>Order notes</label>
-          <input id="notes" placeholder="Leave at door…" />
+          <label>${t("checkout.notes")}</label>
+          <input id="notes" placeholder="${t("checkout.notesPh")}" value="${escapeHtml(notesVal)}" />
+        </div>
+        <div class="field" id="loyalty-redeem-wrap">
+          <label>${t("loyalty.redeem")}</label>
+          <input id="redeem_pts" type="number" min="0" step="10" value="${escapeHtml(String(redeemVal))}" placeholder="0" />
+          <p class="muted" id="loyalty-hint" style="margin-top:0.35rem"></p>
+          <p class="muted" id="loyalty-earn-hint" style="margin-top:0.2rem"></p>
         </div>
 
-        <h2 style="margin-top:1rem">Payment method</h2>
+        <h2 style="margin-top:1rem">${t("checkout.payMethod")}</h2>
         <div class="pay-methods" id="pay-methods">
-          ${PAY_METHODS.map(
-            (m, i) => `
-            <label class="pay-method ${i === 0 ? "active" : ""}">
-              <input type="radio" name="pay_method" value="${m.id}" ${i === 0 ? "checked" : ""} />
+          ${PAY_METHODS().map(
+            (m) => `
+            <label class="pay-method ${m.id === payMethodVal ? "active" : ""}">
+              <input type="radio" name="pay_method" value="${m.id}" ${m.id === payMethodVal ? "checked" : ""} />
               <span><strong>${m.label}</strong><br/><small>${m.hint}</small></span>
             </label>`
           ).join("")}
@@ -596,29 +891,107 @@ async function viewCheckout() {
         <div id="method-fields"></div>
 
         <div class="auth-error" id="checkout-error"></div>
-        <button class="btn btn-primary btn-block" id="place">Continue to payment</button>
-        <button class="btn btn-ghost btn-block" id="back-cart" style="margin-top:0.5rem">Back to cart</button>
+        <button class="btn btn-primary btn-block" id="place">${t("checkout.continue")}</button>
+        <button class="btn btn-ghost btn-block" id="back-cart" style="margin-top:0.5rem">${t("checkout.back")}</button>
       </div>
       <div class="panel">
-        <h2>Order summary</h2>
-        ${(cart.items || [])
-          .map(
-            (it) => `
-          <div class="summary-line">
-            <span>${escapeHtml(it.product?.name || "Item")} × ${it.quantity}</span>
-            <span>${money(it.line_total)}</span>
-          </div>`
-          )
-          .join("")}
+        <h2>${t("checkout.summary")}</h2>
+        <div id="checkout-items">
+          ${(cart.items || [])
+            .map(
+              (it) => `
+            <div class="checkout-item" data-item-id="${it.id}">
+              <img src="${escapeHtml(thumbUrl(it.product?.image_url || it.product?.image || ""))}" alt="" loading="lazy" decoding="async" />
+              <div class="meta">
+                <strong>${escapeHtml(it.product?.name || "Item")}</strong>
+                <div class="muted">× ${it.quantity} · ${money(it.product?.price)} ${t("cart.each")}</div>
+              </div>
+              <div class="actions">
+                <div class="price">${money(it.line_total)}</div>
+                <button type="button" class="btn btn-danger btn-remove" data-rm="${it.id}">${t("checkout.removeItem")}</button>
+              </div>
+            </div>`
+            )
+            .join("")}
+        </div>
         <div class="totals" style="margin-top:0.75rem">
-          <div class="row"><span>Subtotal</span><span>${money(cart.subtotal)}</span></div>
-          <div class="row"><span>Discount</span><span>-${money(cart.discount_amount)}</span></div>
-          <div class="row"><span>Shipping</span><span>${money(cart.shipping_amount)}</span></div>
-          <div class="row"><span>Tax</span><span>${money(cart.tax_amount)}</span></div>
-          <div class="row grand"><span>Total due</span><span>${money(cart.total)}</span></div>
+          <div class="row"><span>${t("cart.subtotal")}</span><span id="sum-subtotal">${money(cart.subtotal)}</span></div>
+          <div class="row"><span>${t("cart.discount")}</span><span id="sum-discount">-${money(cart.discount_amount)}</span></div>
+          <div class="row"><span>${t("loyalty.discount")}</span><span id="sum-points">-$0.00</span></div>
+          <div class="row"><span>${t("cart.shipping")}</span><span id="sum-shipping">${money(cart.shipping_amount)}</span></div>
+          <div class="row"><span>${t("cart.tax")}</span><span id="sum-tax">${money(cart.tax_amount)}</span></div>
+          <div class="row grand"><span>${t("checkout.totalDue")}</span><span id="sum-total">${money(cart.total)}</span></div>
         </div>
       </div>
     </div>`;
+
+  function saveCheckoutDraft() {
+    state.checkoutDraft = {
+      ship: document.getElementById("ship")?.value || "",
+      bill: document.getElementById("bill")?.value || "",
+      coupon: document.getElementById("c_code")?.value || "",
+      notes: document.getElementById("notes")?.value || "",
+      redeem: document.getElementById("redeem_pts")?.value || "0",
+      payMethod: document.querySelector('input[name="pay_method"]:checked')?.value || "card",
+      billSame: !!document.getElementById("bill-same")?.checked,
+    };
+  }
+
+  document.getElementById("checkout-items")?.querySelectorAll("[data-rm]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const itemId = btn.dataset.rm;
+      btn.disabled = true;
+      try {
+        saveCheckoutDraft();
+        await api("DELETE", `/cart/items/${itemId}`);
+        toast(t("checkout.itemRemoved"));
+        const updated = await refreshCartSummary();
+        if (!updated?.items?.length) {
+          state.checkoutDraft = null;
+          toast(t("checkout.needItems"));
+          navigate("cart");
+          return;
+        }
+        viewCheckout();
+      } catch (e) {
+        btn.disabled = false;
+        toast(e.message, "error");
+      }
+    });
+  });
+
+  async function refreshLoyaltyPreview() {
+    const wrap = document.getElementById("loyalty-redeem-wrap");
+    if (!wrap || isAdmin()) {
+      if (wrap) wrap.classList.add("hidden");
+      return;
+    }
+    const redeem = Number(document.getElementById("redeem_pts")?.value || 0);
+    const coupon = document.getElementById("c_code")?.value.trim() || null;
+    try {
+      const prev = await api("POST", "/loyalty/preview", {
+        redeem_points: redeem,
+        coupon_code: coupon,
+      });
+      const hint = document.getElementById("loyalty-hint");
+      const earnHint = document.getElementById("loyalty-earn-hint");
+      const rules = prev.rules || {};
+      if (hint) {
+        hint.textContent = `${t("loyalty.available", { balance: prev.balance })} · ${t("loyalty.redeemHint", {
+          min: rules.min_redeem_points || 100,
+        })}`;
+      }
+      if (earnHint) {
+        earnHint.textContent = t("loyalty.willEarn", { pts: prev.estimated_earn || 0 });
+      }
+      const ptsEl = document.getElementById("sum-points");
+      const totEl = document.getElementById("sum-total");
+      if (ptsEl) ptsEl.textContent = `-${money(prev.points_discount || 0)}`;
+      if (totEl) totEl.textContent = money(prev.cart_total);
+    } catch {
+      /* ignore preview errors while typing */
+    }
+  }
 
   function renderMethodFields() {
     const method = document.querySelector('input[name="pay_method"]:checked')?.value || "card";
@@ -627,22 +1000,25 @@ async function viewCheckout() {
       el.classList.toggle("active", el.querySelector("input")?.value === method);
     });
     if (method === "upi") {
-      box.innerHTML = `<div class="field"><label>UPI ID / VPA</label><input id="upi_id" placeholder="name@upi" value="shopper@oksbi" /></div>`;
+      box.innerHTML = `<div class="field"><label>${t("pay.upiId")}</label><input id="upi_id" placeholder="name@upi" value="shopper@oksbi" /></div>`;
+    } else if (method === "qr") {
+      box.innerHTML = `<div class="field"><label>${t("pay.qrVpa")}</label><input id="upi_id" placeholder="${t("pay.qrMerchantPh")}" value="smartcart@upi" /></div>
+        <p class="muted">${t("pay.qrScan")}</p>`;
     } else if (method === "netbanking") {
-      box.innerHTML = `<div class="field"><label>Bank</label>
+      box.innerHTML = `<div class="field"><label>${t("pay.bank")}</label>
         <select id="bank">
           <option>HDFC Bank</option><option>ICICI Bank</option><option>SBI</option>
           <option>Axis Bank</option><option>Kotak Mahindra</option><option>Demo Bank</option>
         </select></div>`;
     } else if (method === "wallet") {
-      box.innerHTML = `<div class="field"><label>Wallet</label>
+      box.innerHTML = `<div class="field"><label>${t("pay.walletLabel")}</label>
         <select id="wallet">
           <option>PhonePe</option><option>Google Pay</option><option>Paytm</option><option>Amazon Pay</option>
         </select></div>`;
     } else if (method === "cod") {
-      box.innerHTML = `<p class="muted">Pay cash to the delivery partner. A bill is still generated for your records.</p>`;
+      box.innerHTML = `<p class="muted">${t("pay.codNote")}</p>`;
     } else {
-      box.innerHTML = `<p class="muted">Card details are collected securely on the next step.</p>`;
+      box.innerHTML = `<p class="muted">${t("pay.cardNext")}</p>`;
     }
   }
 
@@ -651,45 +1027,114 @@ async function viewCheckout() {
   });
   renderMethodFields();
 
-  document.getElementById("back-cart").onclick = () => navigate("cart");
+  const shipEl = document.getElementById("ship");
+  const billEl = document.getElementById("bill");
+  const sameEl = document.getElementById("bill-same");
+  const syncBilling = () => {
+    if (sameEl?.checked && shipEl && billEl) {
+      billEl.value = shipEl.value;
+      billEl.readOnly = true;
+    } else if (billEl) {
+      billEl.readOnly = false;
+    }
+  };
+  sameEl?.addEventListener("change", syncBilling);
+  shipEl?.addEventListener("input", () => {
+    if (sameEl?.checked) syncBilling();
+  });
+  syncBilling();
+
+  let loyaltyTimer = null;
+  document.getElementById("redeem_pts")?.addEventListener("input", () => {
+    clearTimeout(loyaltyTimer);
+    loyaltyTimer = setTimeout(refreshLoyaltyPreview, 300);
+  });
+  document.getElementById("c_code")?.addEventListener("change", refreshLoyaltyPreview);
+  refreshLoyaltyPreview();
+
+  document.getElementById("back-cart").onclick = () => {
+    state.checkoutDraft = null;
+    navigate("cart");
+  };
   document.getElementById("place").onclick = async () => {
     const err = document.getElementById("checkout-error");
     err.textContent = "";
-    const shipping_address = document.getElementById("ship").value.trim();
-    const billing_address = document.getElementById("bill").value.trim();
-    if (shipping_address.length < 10) {
-      err.textContent = "Enter a full shipping address (at least 10 characters).";
+    saveCheckoutDraft();
+    if (!(state.cart?.items?.length)) {
+      err.textContent = t("checkout.needItems");
+      toast(t("checkout.needItems"), "error");
       return;
     }
+    let shipping_address = document.getElementById("ship").value.trim();
+    let billing_address = document.getElementById("bill").value.trim();
+
+    // If shipping is blank/short but billing is filled, use billing for shipping
+    if (shipping_address.length < 10 && billing_address.length >= 10) {
+      shipping_address = billing_address;
+      document.getElementById("ship").value = shipping_address;
+    }
+    // Blank billing → same as shipping
+    if (!billing_address && shipping_address.length >= 10) {
+      billing_address = shipping_address;
+    }
+
+    if (shipping_address.length < 10) {
+      err.textContent = t("checkout.needAddr");
+      toast(t("checkout.needAddr"), "error");
+      document.getElementById("ship")?.focus();
+      document.getElementById("ship")?.scrollIntoView({ behavior: "smooth", block: "center" });
+      return;
+    }
+    if (billing_address && billing_address.length < 10) {
+      err.textContent = t("checkout.needBillAddr");
+      toast(t("checkout.needBillAddr"), "error");
+      document.getElementById("bill")?.focus();
+      return;
+    }
+
     const payment_method = document.querySelector('input[name="pay_method"]:checked')?.value || "card";
     const payment_details = {};
-    if (payment_method === "upi") payment_details.upi_id = document.getElementById("upi_id")?.value.trim();
+    if (payment_method === "upi" || payment_method === "qr") {
+      payment_details.upi_id = document.getElementById("upi_id")?.value.trim() || "smartcart@upi";
+    }
     if (payment_method === "netbanking") payment_details.bank = document.getElementById("bank")?.value;
     if (payment_method === "wallet") payment_details.wallet = document.getElementById("wallet")?.value;
+    const redeemRaw = document.getElementById("redeem_pts")?.value;
+    const redeem_points = Number.isFinite(Number(redeemRaw)) ? Math.max(0, Math.floor(Number(redeemRaw))) : 0;
 
     const btn = document.getElementById("place");
     btn.disabled = true;
-    btn.textContent = "Creating order…";
+    btn.textContent = t("checkout.creating");
     try {
+      const ok = await ensureAuthSession();
+      if (!ok) {
+        throw new Error(t("auth.sessionExpired"));
+      }
       const coupon = document.getElementById("c_code").value.trim();
       if (coupon) setCoupon(coupon);
       const result = await api("POST", "/checkout", {
         shipping_address,
-        billing_address: billing_address || null,
+        billing_address: billing_address || shipping_address,
         coupon_code: coupon || null,
         notes: document.getElementById("notes").value.trim() || null,
         payment_method,
         payment_details,
+        redeem_points: redeem_points > 0 ? redeem_points : 0,
       });
+      if (!result || !result.order) {
+        throw new Error(t("checkout.failed"));
+      }
       state.pendingPayment = result;
+      state.checkoutDraft = null;
       setCartCount(0);
-      toast(result.message || "Order created — complete payment");
+      toast(result.message || t("checkout.created"));
       navigate("payment");
     } catch (e) {
-      err.textContent = e.message;
-      toast(e.message, "error");
+      err.textContent = e.message || t("checkout.failed");
+      toast(e.message || t("checkout.failed"), "error");
       btn.disabled = false;
-      btn.textContent = "Continue to payment";
+      btn.textContent = t("checkout.continue");
+      if (e.authFailed || e.status === 401) navigate("account");
     }
   };
 }
@@ -699,8 +1144,8 @@ async function viewPayment() {
   const pending = state.pendingPayment;
   if (!pending?.order) {
     root.innerHTML = `
-      <div class="hero"><h1>Payment</h1><p>No pending payment</p></div>
-      <div class="panel"><button class="btn btn-primary" id="to-cart">Go to cart</button></div>`;
+      <div class="hero"><h1>${t("pay.title")}</h1><p>${t("pay.none")}</p></div>
+      <div class="panel"><button class="btn btn-primary" id="to-cart">${t("pay.toCart")}</button></div>`;
     document.getElementById("to-cart").onclick = () => navigate("cart");
     return;
   }
@@ -712,62 +1157,75 @@ async function viewPayment() {
     payment.stripe_payment_intent_id ||
     (pending.client_secret || "").split("_secret")[0] ||
     `${method}_sim`;
-  const methodLabel = (PAY_METHODS.find((m) => m.id === method) || {}).label || method;
+  const methodLabel = (PAY_METHODS().find((m) => m.id === method) || {}).label || method;
 
   let formHtml = "";
   if (method === "card") {
     formHtml = `
-      <div class="field"><label>Cardholder name</label><input id="card-name" value="Test Shopper" /></div>
-      <div class="field"><label>Card number</label><input id="card-num" value="4242 4242 4242 4242" maxlength="19" /></div>
+      <div class="field"><label>${t("pay.cardName")}</label><input id="card-name" value="Test Shopper" /></div>
+      <div class="field"><label>${t("pay.cardNum")}</label><input id="card-num" value="4242 4242 4242 4242" maxlength="19" /></div>
       <div class="pay-row">
-        <div class="field"><label>Expiry</label><input id="card-exp" value="12/30" /></div>
-        <div class="field"><label>CVC</label><input id="card-cvc" value="123" maxlength="4" /></div>
+        <div class="field"><label>${t("pay.expiry")}</label><input id="card-exp" value="12/30" /></div>
+        <div class="field"><label>${t("pay.cvc")}</label><input id="card-cvc" value="123" maxlength="4" /></div>
       </div>`;
-  } else if (method === "upi") {
+  } else if (method === "qr" || method === "upi") {
+    const qrImg = pending.qr_image_base64
+      ? `<div class="qr-box">
+          <img class="qr-image" alt="Payment QR" src="data:image/png;base64,${pending.qr_image_base64}" />
+          <div class="qr-caption"><strong>${t("pay.qrTitle")}</strong><br/>${t("pay.qrScan")}</div>
+          <div class="qr-meta">${t("pay.qrAmount")}: <strong>${money(order.total_amount)}</strong></div>
+          <div class="qr-meta">${t("pay.qrVpa")}: <code>${escapeHtml(pending.qr_vpa || "smartcart@upi")}</code></div>
+        </div>`
+      : `<p class="muted">${t("pay.approveUpi")}</p>`;
     formHtml = `
-      <div class="field"><label>UPI ID used</label><input id="pay-ref" value="shopper@oksbi" /></div>
-      <p class="muted">Approve the collect request in your UPI app, then confirm.</p>`;
+      ${qrImg}
+      <div class="field"><label>${t("pay.upiUsed")}</label><input id="pay-ref" value="${escapeHtml(pending.qr_vpa || "shopper@oksbi")}" /></div>`;
   } else if (method === "netbanking") {
     formHtml = `
-      <div class="field"><label>Bank login ID (sandbox)</label><input id="pay-ref" value="demo_user" /></div>
-      <p class="muted">Authorize the net-banking transaction, then confirm.</p>`;
+      <div class="field"><label>${t("pay.bankLogin")}</label><input id="pay-ref" value="demo_user" /></div>
+      <p class="muted">${t("pay.approveNb")}</p>`;
   } else if (method === "wallet") {
     formHtml = `
-      <div class="field"><label>Wallet mobile</label><input id="pay-ref" value="9999999999" /></div>
-      <p class="muted">Approve wallet debit, then confirm.</p>`;
+      <div class="field"><label>${t("pay.walletMobile")}</label><input id="pay-ref" value="9999999999" /></div>
+      <p class="muted">${t("pay.approveWallet")}</p>`;
   } else {
-    formHtml = `<p class="muted">Confirm to place your Cash on Delivery order. Pay the delivery partner in cash.</p>`;
+    formHtml = `<p class="muted">${t("pay.codConfirmHint")}</p>`;
   }
+
+  const payBtnLabel =
+    method === "cod"
+      ? t("pay.confirmCod")
+      : method === "qr"
+        ? t("pay.qrConfirm")
+        : t("pay.now", { amount: money(order.total_amount) });
 
   root.innerHTML = `
     <div class="hero">
-      <h1>Payment gateway</h1>
-      <p>${escapeHtml(methodLabel)} · Order ${escapeHtml(order.order_number)}</p>
+      <h1>${t("pay.title")}</h1>
+      <p>${escapeHtml(methodLabel)} · ${t("orders.colOrder")} ${escapeHtml(order.order_number)}</p>
     </div>
     <div class="checkout-grid">
       <div class="panel pay-card">
-        <div class="pay-brand">SmartCart Pay · ${escapeHtml(methodLabel)}</div>
+        <div class="pay-brand">${t("pay.brand")} · ${escapeHtml(methodLabel)}</div>
         <p class="muted">${pending.payment_instructions || escapeHtml(pending.message || "")}</p>
         <div class="pay-amount">${money(order.total_amount)}</div>
         ${formHtml}
         <div class="auth-error" id="pay-error"></div>
-        <button class="btn btn-primary btn-block" id="pay-success">
-          ${method === "cod" ? "Confirm COD order" : `Pay ${money(order.total_amount)}`}
-        </button>
+        <button class="btn btn-primary btn-block" id="pay-success">${payBtnLabel}</button>
         ${
           method !== "cod"
-            ? `<button class="btn btn-danger btn-block" id="pay-fail" style="margin-top:0.5rem">Simulate payment failure</button>`
+            ? `<button class="btn btn-danger btn-block" id="pay-fail" style="margin-top:0.5rem">${t("pay.fail")}</button>`
             : ""
         }
-        <p class="muted" style="margin-top:0.75rem;font-size:0.82rem">Sandbox gateway — after success you can download the bill/invoice.</p>
+        <p class="muted" style="margin-top:0.75rem;font-size:0.82rem">${t("pay.sandboxNote")}</p>
       </div>
       <div class="panel">
-        <h2>Order ${escapeHtml(order.order_number)}</h2>
-        <div class="summary-line"><span>Method</span><span>${escapeHtml(methodLabel)}</span></div>
-        <div class="summary-line"><span>Status</span><span>${escapeHtml(order.status)}</span></div>
-        <div class="summary-line"><span>Payment</span><span>${escapeHtml(order.payment_status || "pending")}</span></div>
+        <h2>${t("orders.colOrder")} ${escapeHtml(order.order_number)}</h2>
+        <div class="summary-line"><span>${t("pay.method")}</span><span>${escapeHtml(methodLabel)}</span></div>
+        <div class="summary-line"><span>${t("pay.status")}</span><span>${escapeHtml(order.status)}</span></div>
+        <div class="summary-line"><span>${t("pay.payment")}</span><span>${escapeHtml(order.payment_status || "pending")}</span></div>
         <div class="totals">
-          <div class="row grand"><span>Total</span><span>${money(order.total_amount)}</span></div>
+          <div class="row grand"><span>${t("cart.total")}</span><span>${money(order.total_amount)}</span></div>
         </div>
         ${(order.items || [])
           .map(
@@ -793,11 +1251,16 @@ async function viewPayment() {
       setCoupon("");
       state.lastOrder = confirmed;
       await refreshCartSummary();
+      await refreshUserProfile();
       if (confirmed.status === "paid") {
-        toast(method === "cod" ? "COD order placed" : "Payment successful");
+        const earned = Number(confirmed.points_earned || 0);
+        if (earned > 0) toast(t("loyalty.earned", { pts: earned }));
+        else toast(method === "cod" ? t("pay.codOk") : t("pay.success"));
         navigate("confirmation");
+        // Auto-generate / download bill after successful payment
+        setTimeout(() => downloadBill(confirmed.id, confirmed.order_number), 400);
       } else {
-        toast("Payment failed — order cancelled", "error");
+        toast(t("pay.failed"), "error");
         navigate("orders");
       }
     } catch (e) {
@@ -819,28 +1282,36 @@ function viewConfirmation() {
     return;
   }
   const method = (order.payment && order.payment.provider) || "card";
-  const methodLabel = (PAY_METHODS.find((m) => m.id === method) || {}).label || method;
+  const methodLabel = (PAY_METHODS().find((m) => m.id === method) || {}).label || method;
   root.innerHTML = `
     <div class="hero">
-      <h1>Order confirmed</h1>
-      <p>Bill ready · continue shopping or download invoice</p>
+      <h1>${t("confirm.title")}</h1>
+      <p>${t("confirm.sub")}</p>
     </div>
     <div class="panel confirm-box">
       <div class="confirm-check">✓</div>
-      <h2>Order ${escapeHtml(order.order_number)}</h2>
-      <p class="muted">Status: <strong>${escapeHtml(order.status)}</strong> ·
-        Payment: <strong>${escapeHtml(order.payment_status || "succeeded")}</strong> ·
-        Method: <strong>${escapeHtml(methodLabel)}</strong></p>
+      <h2>${t("orders.colOrder")} ${escapeHtml(order.order_number)}</h2>
+      <p class="muted">${t("confirm.status")}: <strong>${escapeHtml(order.status)}</strong> ·
+        ${t("confirm.payment")}: <strong>${escapeHtml(order.payment_status || "succeeded")}</strong> ·
+        ${t("confirm.method")}: <strong>${escapeHtml(methodLabel)}</strong></p>
       <div class="pay-amount" style="margin:1rem 0">${money(order.total_amount)}</div>
+      ${
+        Number(order.points_earned || 0) > 0
+          ? `<p style="font-weight:700;color:var(--teal-deep)">${t("loyalty.earned", {
+              pts: order.points_earned,
+            })}</p>`
+          : ""
+      }
       <div class="btn-row" style="justify-content:center;flex-wrap:wrap">
-        <button class="btn btn-primary" id="dl-bill">Download bill (PDF)</button>
-        <button class="btn btn-ghost" id="see-orders">View orders</button>
-        <button class="btn btn-ghost" id="keep-shop">Continue shopping</button>
+        <button class="btn btn-primary" id="dl-bill">${t("confirm.download")}</button>
+        <button class="btn btn-ghost" id="see-orders">${t("confirm.orders")}</button>
+        <button class="btn btn-ghost" id="keep-shop">${t("confirm.shop")}</button>
       </div>
     </div>`;
   document.getElementById("dl-bill").onclick = () => downloadBill(order.id, order.order_number);
   document.getElementById("see-orders").onclick = () => navigate("orders");
   document.getElementById("keep-shop").onclick = () => navigate("shop");
+  refreshUserProfile();
 }
 
 async function viewOrders() {
@@ -850,9 +1321,9 @@ async function viewOrders() {
     return;
   }
   const isAdm = isAdmin();
-  root.innerHTML = `<div class="hero"><h1>${isAdm ? "All orders & bills" : "Orders"}</h1>
-    <p>${isAdm ? "Admin can download bills for any order" : "Track purchases, pay pending, download bills"}</p></div>
-    <div class="panel" id="orders">Loading…</div>`;
+  root.innerHTML = `<div class="hero"><h1>${isAdm ? t("orders.titleAdmin") : t("orders.title")}</h1>
+    <p>${isAdm ? t("orders.subAdmin") : t("orders.sub")}</p></div>
+    <div class="panel" id="orders">${t("common.loading")}</div>`;
   try {
     const orders = isAdm
       ? await api("GET", "/admin/orders", null, { limit: 50 })
@@ -860,13 +1331,13 @@ async function viewOrders() {
     const list = Array.isArray(orders) ? orders : orders.items || [];
     const el = document.getElementById("orders");
     if (!list.length) {
-      el.innerHTML = `<p class="muted">No orders yet.</p><button class="btn btn-primary" id="shop">Start shopping</button>`;
+      el.innerHTML = `<p class="muted">${t("orders.empty")}</p><button class="btn btn-primary" id="shop">${t("orders.start")}</button>`;
       document.getElementById("shop").onclick = () => navigate("shop");
       return;
     }
     el.innerHTML = `
       <table class="table">
-        <thead><tr><th>Order</th><th>Status</th><th>Method</th><th>Payment</th><th>Total</th><th>Date</th><th></th></tr></thead>
+        <thead><tr><th>${t("orders.colOrder")}</th><th>${t("orders.colStatus")}</th><th>${t("orders.colMethod")}</th><th>${t("orders.colPayment")}</th><th>${t("orders.colTotal")}</th><th>${t("orders.colDate")}</th><th></th></tr></thead>
         <tbody>
           ${list
             .map((o) => {
@@ -883,10 +1354,10 @@ async function viewOrders() {
               <td>${money(o.total_amount)}</td>
               <td class="muted">${escapeHtml((o.order_date || o.created_at || "").toString().slice(0, 10))}</td>
               <td class="btn-row">
-                <button class="btn btn-ghost" data-bill="${o.id}" data-num="${escapeHtml(o.order_number || o.id)}">Bill</button>
+                <button class="btn btn-ghost" data-bill="${o.id}" data-num="${escapeHtml(o.order_number || o.id)}">${t("orders.bill")}</button>
                 ${
                   canPay
-                    ? `<button class="btn btn-primary" data-pay="${o.id}">Pay</button>`
+                    ? `<button class="btn btn-primary" data-pay="${o.id}">${t("orders.pay")}</button>`
                     : ""
                 }
               </td>
@@ -907,14 +1378,66 @@ async function viewOrders() {
           publishable_key: "",
           simulated: true,
           payment_method: (ord.payment || {}).provider || "card",
-          message: "Complete pending payment",
-          payment_instructions: "Confirm to finish payment and generate your bill.",
+          message: t("pay.pendingMsg"),
+          payment_instructions: t("pay.pendingInstr"),
         };
         navigate("payment");
       })
     );
   } catch (e) {
     toast(e.message, "error");
+  }
+}
+
+async function loadLoyaltyPanel() {
+  const el = document.getElementById("loyalty-panel");
+  if (!el) return;
+  try {
+    const data = await api("GET", "/loyalty/me");
+    if (state.user) {
+      state.user.loyalty_points = data.balance;
+      localStorage.setItem("sc_user", JSON.stringify(state.user));
+      renderChrome();
+    }
+    const role = (state.user?.role || "customer").toLowerCase();
+    if (role !== "customer") {
+      el.innerHTML = `<div class="muted">${t("loyalty.adminNote")}</div>`;
+      return;
+    }
+    const rules = data.rules || {};
+    const dollars = (
+      ((rules.min_redeem_points || 100) * (rules.cents_per_point || 1)) /
+      100
+    ).toFixed(0);
+    const history = (data.recent || [])
+      .slice(0, 8)
+      .map((tx) => {
+        const cls = tx.points >= 0 ? "pos" : "neg";
+        const sign = tx.points >= 0 ? "+" : "";
+        return `<div class="loyalty-tx">
+          <span>${escapeHtml(tx.note || tx.tx_type)}</span>
+          <span class="${cls}">${sign}${tx.points}</span>
+        </div>`;
+      })
+      .join("");
+    el.innerHTML = `
+      <div class="muted">${t("loyalty.title")}</div>
+      <div class="loyalty-balance">${data.balance} <small>${t("loyalty.pts")}</small></div>
+      <div class="loyalty-meta">
+        <span>${t("loyalty.earnedLife")}: <strong>${data.lifetime_earned}</strong></span>
+        <span>${t("loyalty.redeemedLife")}: <strong>${data.lifetime_redeemed}</strong></span>
+      </div>
+      <p class="muted" style="margin-top:0.55rem;font-size:0.85rem">${t("loyalty.rules", {
+        earn: rules.points_per_dollar || 1,
+        min: rules.min_redeem_points || 100,
+        dollars,
+        bonus: rules.signup_bonus || 50,
+      })}</p>
+      <h3 style="margin-top:0.85rem;font-size:1rem">${t("loyalty.history")}</h3>
+      ${history || `<p class="muted">${t("loyalty.empty")}</p>`}
+    `;
+  } catch (e) {
+    el.innerHTML = `<p class="muted">${escapeHtml(e.message)}</p>`;
   }
 }
 
@@ -926,17 +1449,18 @@ function viewAccount() {
     const role = (state.user.role || "customer").toLowerCase();
     root.innerHTML = `
       <div class="hero">
-        <h1>My Account</h1>
-        <p>You are signed in as ${escapeHtml(role)}</p>
+        <h1>${t("account.mine")}</h1>
+        <p>${t("account.signedAs", { role: tRole(role) })}</p>
       </div>
       <div class="panel profile-card">
         <h2>${escapeHtml(name)}</h2>
-        <p class="muted">User ID · ${escapeHtml(state.user.email || "")}</p>
-        <span class="role-pill ${role === "admin" ? "admin" : "customer"}">${escapeHtml(role)}</span>
+        <p class="muted">${t("account.userId")} · ${escapeHtml(state.user.email || "")}</p>
+        <span class="role-pill ${role === "admin" ? "admin" : "customer"}">${escapeHtml(tRole(role))}</span>
+        <div id="loyalty-panel" class="loyalty-card"><div class="muted">${t("common.loading")}</div></div>
         <div class="btn-row" style="margin-top:1rem">
-          <button class="btn btn-primary" id="go-shop">Continue shopping</button>
-          ${isAdmin() ? '<button class="btn btn-ghost" id="go-admin">Admin Dashboard</button>' : ""}
-          <button class="btn btn-danger" id="do-logout">Logout</button>
+          <button class="btn btn-primary" id="go-shop">${t("account.continue")}</button>
+          ${isAdmin() ? `<button class="btn btn-ghost" id="go-admin">${t("account.adminDash")}</button>` : ""}
+          <button class="btn btn-danger" id="do-logout">${t("user.logout")}</button>
         </div>
       </div>`;
     document.getElementById("go-shop").onclick = () => navigate("shop");
@@ -944,73 +1468,74 @@ function viewAccount() {
     if (goAdmin) goAdmin.onclick = () => navigate("admin");
     document.getElementById("do-logout").onclick = () => {
       clearAuth();
-      toast("Logged out");
+      toast(t("account.loggedOut"));
       viewAccount();
       renderChrome();
     };
+    loadLoyaltyPanel();
     return;
   }
 
   root.innerHTML = `
     <div class="hero">
-      <h1>Login / Register</h1>
-      <p>Sign in as guest or admin · or create a new guest account</p>
+      <h1>${t("account.title")}</h1>
+      <p>${t("account.sub")}</p>
     </div>
 
     <div class="demo-box">
-      <strong>Admin demo credentials</strong><br />
-      User ID: <code>admin@smartcart.com</code> &nbsp;·&nbsp;
-      Password: <code>Admin@12345</code>
+      <strong>${t("account.demo")}</strong><br />
+      ${t("account.userId")}: <code>admin@smartcart.com</code> &nbsp;·&nbsp;
+      ${t("account.password")}: <code>Admin@12345</code>
       <div class="btn-row" style="margin-top:0.65rem">
-        <button class="btn btn-ghost" type="button" id="fill-admin">Use admin login</button>
+        <button class="btn btn-ghost" type="button" id="fill-admin">${t("account.useAdmin")}</button>
       </div>
     </div>
 
     <div class="auth-tabs">
-      <button class="auth-tab active" type="button" data-tab="login">Login</button>
-      <button class="auth-tab" type="button" data-tab="register">New guest registration</button>
+      <button class="auth-tab active" type="button" data-tab="login">${t("account.tabLogin")}</button>
+      <button class="auth-tab" type="button" data-tab="register">${t("account.tabReg")}</button>
     </div>
 
     <div class="panel" id="panel-login">
-      <h2>Sign in</h2>
-      <p class="muted" style="margin-bottom:0.85rem">Works for both guest (customer) and admin accounts.</p>
+      <h2>${t("account.signIn")}</h2>
+      <p class="muted" style="margin-bottom:0.85rem">${t("account.signInHint")}</p>
       <div class="field">
-        <label>User ID (Email)</label>
+        <label>${t("account.email")}</label>
         <input id="login-email" type="email" autocomplete="username" placeholder="you@example.com" />
       </div>
       <div class="field">
-        <label>Password</label>
+        <label>${t("account.password")}</label>
         <input id="login-pass" type="password" autocomplete="current-password" placeholder="••••••••" />
       </div>
       <div class="auth-error" id="login-error"></div>
-      <button class="btn btn-primary btn-block" id="btn-login">Login</button>
+      <button class="btn btn-primary btn-block" id="btn-login">${t("account.loginBtn")}</button>
     </div>
 
     <div class="panel hidden" id="panel-register">
-      <h2>Create guest account</h2>
-      <p class="muted" style="margin-bottom:0.85rem">Register a new customer with a User ID and password.</p>
+      <h2>${t("account.createTitle")}</h2>
+      <p class="muted" style="margin-bottom:0.85rem">${t("account.createHint")}</p>
       <div class="field">
-        <label>Full name</label>
+        <label>${t("account.fullName")}</label>
         <input id="reg-name" autocomplete="name" placeholder="Jane Shopper" />
       </div>
       <div class="field">
-        <label>User ID (Email)</label>
+        <label>${t("account.email")}</label>
         <input id="reg-email" type="email" autocomplete="username" placeholder="jane@example.com" />
       </div>
       <div class="field">
-        <label>Phone (optional)</label>
+        <label>${t("account.phone")}</label>
         <input id="reg-phone" type="tel" placeholder="+1 555 0100" />
       </div>
       <div class="field">
-        <label>Password</label>
+        <label>${t("account.password")}</label>
         <input id="reg-pass" type="password" autocomplete="new-password" placeholder="Min. 8 characters" />
       </div>
       <div class="field">
-        <label>Confirm password</label>
+        <label>${t("account.confirmPw")}</label>
         <input id="reg-pass2" type="password" autocomplete="new-password" />
       </div>
       <div class="auth-error" id="reg-error"></div>
-      <button class="btn btn-primary btn-block" id="btn-reg">Create guest account</button>
+      <button class="btn btn-primary btn-block" id="btn-reg">${t("account.createBtn")}</button>
     </div>`;
 
   const showTab = (tab) => {
@@ -1030,7 +1555,7 @@ function viewAccount() {
     document.getElementById("login-email").value = "admin@smartcart.com";
     document.getElementById("login-pass").value = "Admin@12345";
     document.getElementById("login-error").textContent = "";
-    toast("Admin credentials filled — click Login");
+    toast(t("account.filled"));
   };
 
   document.getElementById("btn-login").onclick = async () => {
@@ -1039,14 +1564,14 @@ function viewAccount() {
     const email = document.getElementById("login-email").value.trim();
     const password = document.getElementById("login-pass").value;
     if (!email || !password) {
-      err.textContent = "Enter User ID and password.";
+      err.textContent = t("account.needCreds");
       return;
     }
     try {
       const data = await api("POST", "/auth/login", { email, password });
       saveAuth(data);
       const role = (data.user?.role || "customer").toLowerCase();
-      toast(role === "admin" ? "Welcome, Admin" : "Welcome back");
+      toast(role === "admin" ? t("account.welcomeAdmin") : t("account.welcomeBack"));
       navigate(role === "admin" ? "admin" : "shop");
     } catch (e) {
       err.textContent = e.message;
@@ -1064,19 +1589,19 @@ function viewAccount() {
     const password2 = document.getElementById("reg-pass2").value;
 
     if (full_name.length < 2) {
-      err.textContent = "Enter your full name.";
+      err.textContent = t("account.needName");
       return;
     }
     if (!email) {
-      err.textContent = "Enter a User ID (email).";
+      err.textContent = t("account.needEmail");
       return;
     }
     if (password.length < 8) {
-      err.textContent = "Password must be at least 8 characters.";
+      err.textContent = t("account.pwLen");
       return;
     }
     if (password !== password2) {
-      err.textContent = "Passwords do not match.";
+      err.textContent = t("account.pwMatch");
       return;
     }
 
@@ -1085,7 +1610,9 @@ function viewAccount() {
       if (phone) payload.phone = phone;
       const data = await api("POST", "/auth/register", payload);
       saveAuth(data);
-      toast("Guest account created — you are signed in");
+      const bonus = Number(data.user?.loyalty_points || 0);
+      if (bonus > 0) toast(t("loyalty.signup", { pts: bonus }));
+      else toast(t("account.created"));
       navigate("shop");
     } catch (e) {
       err.textContent = e.message;
@@ -1104,25 +1631,25 @@ function viewAccount() {
 
 async function viewAdmin() {
   if (!isAdmin()) {
-    toast("Admin only", "error");
+    toast(t("admin.only"), "error");
     navigate("shop");
     return;
   }
   const root = document.getElementById("app");
   root.innerHTML = `
-    <div class="hero"><h1>Admin Dashboard</h1><p>Revenue · Orders · Inventory · Coupons</p></div>
+    <div class="hero"><h1>${t("admin.title")}</h1><p>${t("admin.sub")}</p></div>
     <div class="btn-row" style="margin-bottom:1rem">
-      <button class="btn btn-primary" id="go-catalog">Manage Products</button>
-      <button class="btn btn-ghost" id="go-shop-admin">View Shop</button>
+      <button class="btn btn-primary" id="go-catalog">${t("admin.manage")}</button>
+      <button class="btn btn-ghost" id="go-shop-admin">${t("admin.viewShop")}</button>
     </div>
-    <div id="kpis" class="kpi-row"><div class="muted">Loading…</div></div>
-    <div class="section-title">Top Products</div>
+    <div id="kpis" class="kpi-row"><div class="muted">${t("common.loading")}</div></div>
+    <div class="section-title">${t("admin.top")}</div>
     <div class="panel" id="top"></div>
-    <div class="section-title">Low Stock</div>
+    <div class="section-title">${t("admin.low")}</div>
     <div class="panel" id="low"></div>
-    <div class="section-title">Coupons</div>
+    <div class="section-title">${t("admin.coupons")}</div>
     <div class="panel" id="coupons"></div>
-    <div class="section-title">Inventory</div>
+    <div class="section-title">${t("admin.inventory")}</div>
     <div class="panel" id="inv"></div>`;
   document.getElementById("go-catalog").onclick = () => navigate("catalog");
   document.getElementById("go-shop-admin").onclick = () => navigate("shop");
@@ -1131,14 +1658,14 @@ async function viewAdmin() {
     state.dash = dash;
     const k = dash.kpis || {};
     document.getElementById("kpis").innerHTML = [
-      ["Today's Revenue", money(k.today_revenue), ""],
-      ["Monthly Revenue", money(k.monthly_revenue), "sky"],
-      ["Total Orders", k.total_orders ?? 0, "coral"],
-      ["Users", k.users ?? 0, "amber"],
-      ["Pending Orders", k.pending_orders ?? 0, "amber"],
-      ["Cancelled Orders", k.cancelled_orders ?? 0, "coral"],
-      ["Low Stock", k.low_stock_count ?? 0, "lime"],
-      ["Active Coupons", k.active_coupons ?? 0, "sky"],
+      [t("admin.todayRev"), money(k.today_revenue), ""],
+      [t("admin.monthRev"), money(k.monthly_revenue), "sky"],
+      [t("admin.totalOrders"), k.total_orders ?? 0, "coral"],
+      [t("admin.users"), k.users ?? 0, "amber"],
+      [t("admin.pending"), k.pending_orders ?? 0, "amber"],
+      [t("admin.cancelled"), k.cancelled_orders ?? 0, "coral"],
+      [t("admin.low"), k.low_stock_count ?? 0, "lime"],
+      [t("admin.activeCoupons"), k.active_coupons ?? 0, "sky"],
     ]
       .map(
         ([label, value, tone]) =>
@@ -1147,7 +1674,7 @@ async function viewAdmin() {
       .join("");
 
     const table = (rows, cols) => {
-      if (!rows || !rows.length) return `<p class="muted">Nothing to show.</p>`;
+      if (!rows || !rows.length) return `<p class="muted">${t("admin.nothing")}</p>`;
       const keys = cols || Object.keys(rows[0]);
       return `<table class="table"><thead><tr>${keys.map((k) => `<th>${escapeHtml(k)}</th>`).join("")}</tr></thead>
         <tbody>${rows
@@ -1171,9 +1698,9 @@ async function viewAdmin() {
     const inv = dash.inventory || {};
     document.getElementById("inv").innerHTML = `
       <p class="muted" style="margin-bottom:0.75rem">
-        Products: <strong>${inv.total_products ?? 0}</strong> ·
-        Low stock: <strong>${inv.low_stock_count ?? 0}</strong> ·
-        Out of stock: <strong>${inv.out_of_stock_count ?? 0}</strong>
+        ${t("admin.products")}: <strong>${inv.total_products ?? 0}</strong> ·
+        ${t("admin.lowStock")}: <strong>${inv.low_stock_count ?? 0}</strong> ·
+        ${t("admin.outStock")}: <strong>${inv.out_of_stock_count ?? 0}</strong>
       </p>
       ${table(inv.items)}`;
   } catch (e) {
@@ -1210,76 +1737,76 @@ const IMAGE_PRESETS = [
 
 async function viewCatalog() {
   if (!isAdmin()) {
-    toast("Admin only", "error");
+    toast(t("admin.only"), "error");
     navigate("shop");
     return;
   }
   const root = document.getElementById("app");
   root.innerHTML = `
     <div class="hero">
-      <h1>Manage Products</h1>
-      <p>Add categories & products — they appear on the shop for cart, checkout, and payment</p>
+      <h1>${t("catalog.title")}</h1>
+      <p>${t("catalog.sub")}</p>
     </div>
     <div class="checkout-grid">
       <div class="panel">
-        <h2>Add product</h2>
+        <h2>${t("catalog.addProduct")}</h2>
         <div class="field">
-          <label>Product name</label>
+          <label>${t("catalog.name")}</label>
           <input id="p-name" placeholder="Galaxy Phone Case" />
         </div>
         <div class="field">
-          <label>SKU</label>
+          <label>${t("catalog.sku")}</label>
           <input id="p-sku" placeholder="MB-CASE-001" />
         </div>
         <div class="field">
-          <label>Description</label>
+          <label>${t("catalog.desc")}</label>
           <textarea id="p-desc" placeholder="Product details for shoppers…"></textarea>
         </div>
         <div class="pay-row">
           <div class="field">
-            <label>Price (USD)</label>
+            <label>${t("catalog.price")}</label>
             <input id="p-price" type="number" min="0.01" step="0.01" placeholder="49.99" />
           </div>
           <div class="field">
-            <label>Stock</label>
+            <label>${t("catalog.stock")}</label>
             <input id="p-stock" type="number" min="0" step="1" value="25" />
           </div>
         </div>
         <div class="field">
-          <label>Category</label>
+          <label>${t("catalog.category")}</label>
           <select id="p-cat"></select>
         </div>
         <div class="field">
-          <label>Image URL</label>
+          <label>${t("catalog.image")}</label>
           <input id="p-image" placeholder="https://…" />
           <div class="preset-row" id="img-presets"></div>
           <img id="p-preview" class="img-preview hidden" alt="Preview" />
         </div>
         <label class="check-row">
-          <input type="checkbox" id="p-featured" /> Featured on shop
+          <input type="checkbox" id="p-featured" /> ${t("catalog.featured")}
         </label>
         <div class="auth-error" id="p-error"></div>
-        <button class="btn btn-primary btn-block" id="p-save">Add product to shop</button>
+        <button class="btn btn-primary btn-block" id="p-save">${t("catalog.save")}</button>
       </div>
 
       <div>
         <div class="panel">
-          <h2>Add category</h2>
+          <h2>${t("catalog.addCat")}</h2>
           <div class="field">
-            <label>Category name</label>
-            <input id="c-name" placeholder="Mobile, Electronics, Beauty…" />
+            <label>${t("catalog.catName")}</label>
+            <input id="c-name" placeholder="${t("catalog.catPh")}" />
           </div>
           <div class="field">
-            <label>Description</label>
+            <label>${t("catalog.catDesc")}</label>
             <input id="c-desc" placeholder="Short description" />
           </div>
           <div class="auth-error" id="c-error"></div>
-          <button class="btn btn-ghost btn-block" id="c-save">Create category</button>
+          <button class="btn btn-ghost btn-block" id="c-save">${t("catalog.createCat")}</button>
           <div id="cat-list" class="muted" style="margin-top:0.85rem"></div>
         </div>
         <div class="panel" style="margin-top:1rem">
-          <h2>Shop catalog</h2>
-          <div id="admin-products"><div class="muted">Loading…</div></div>
+          <h2>${t("catalog.shopCatalog")}</h2>
+          <div id="admin-products"><div class="muted">${t("catalog.loading")}</div></div>
         </div>
       </div>
     </div>`;
@@ -1312,11 +1839,11 @@ async function viewCatalog() {
     const cats = await api("GET", "/categories", null, { active_only: false });
     state.categories = cats;
     const sel = document.getElementById("p-cat");
-    sel.innerHTML = `<option value="">Select category</option>` +
-      cats.map((c) => `<option value="${c.id}">${escapeHtml(c.name)}</option>`).join("");
+    sel.innerHTML = `<option value="">${t("catalog.selectCat")}</option>` +
+      cats.map((c) => `<option value="${c.id}">${escapeHtml(tCat(c.name))}</option>`).join("");
     document.getElementById("cat-list").innerHTML =
-      cats.map((c) => `<span class="chip">${escapeHtml(c.name)}</span>`).join(" ") ||
-      "No categories yet.";
+      cats.map((c) => `<span class="chip">${escapeHtml(tCat(c.name))}</span>`).join(" ") ||
+      t("catalog.noCats");
   }
 
   async function loadProducts() {
@@ -1328,7 +1855,7 @@ async function viewCatalog() {
     const items = data.items || [];
     const box = document.getElementById("admin-products");
     if (!items.length) {
-      box.innerHTML = `<p class="muted">No products yet — add one on the left.</p>`;
+      box.innerHTML = `<p class="muted">${t("catalog.none")}</p>`;
       return;
     }
     box.innerHTML = items
@@ -1338,11 +1865,11 @@ async function viewCatalog() {
         <img src="${escapeHtml(p.image_url || p.image || "")}" alt="" />
         <div>
           <strong>${escapeHtml(p.name)}</strong>
-          <div class="muted">${escapeHtml((p.category && p.category.name) || "Uncategorized")} · ${money(p.price)} · stock ${p.stock_quantity ?? p.stock ?? 0}</div>
+          <div class="muted">${escapeHtml(tCat((p.category && p.category.name) || "") || t("catalog.uncat"))} · ${money(p.price)} · ${t("catalog.stock")} ${p.stock_quantity ?? p.stock ?? 0}</div>
         </div>
         <div class="btn-row">
-          <button class="btn btn-ghost" data-view="${p.id}">View</button>
-          <button class="btn btn-danger" data-del="${p.id}">Delete</button>
+          <button class="btn btn-ghost" data-view="${p.id}">${t("catalog.view")}</button>
+          <button class="btn btn-danger" data-del="${p.id}">${t("catalog.delete")}</button>
         </div>
       </div>`
       )
@@ -1352,10 +1879,10 @@ async function viewCatalog() {
     );
     box.querySelectorAll("[data-del]").forEach((b) =>
       b.addEventListener("click", async () => {
-        if (!confirm("Delete this product from the shop?")) return;
+        if (!confirm(t("catalog.confirmDel"))) return;
         try {
           await api("DELETE", `/products/${b.dataset.del}`);
-          toast("Product deleted");
+          toast(t("catalog.deleted"));
           loadProducts();
         } catch (e) {
           toast(e.message, "error");
@@ -1370,12 +1897,12 @@ async function viewCatalog() {
     const name = document.getElementById("c-name").value.trim();
     const description = document.getElementById("c-desc").value.trim();
     if (name.length < 2) {
-      err.textContent = "Enter a category name.";
+      err.textContent = t("catalog.needCatName");
       return;
     }
     try {
       await api("POST", "/categories", { name, description: description || null, is_active: true });
-      toast(`Category “${name}” created`);
+      toast(t("catalog.catCreated", { name }));
       document.getElementById("c-name").value = "";
       document.getElementById("c-desc").value = "";
       await loadCategories();
@@ -1400,19 +1927,19 @@ async function viewCatalog() {
     const is_featured = document.getElementById("p-featured").checked;
 
     if (name.length < 2) {
-      err.textContent = "Enter a product name.";
+      err.textContent = t("catalog.needName");
       return;
     }
     if (sku.length < 2) {
-      err.textContent = "Enter a SKU code.";
+      err.textContent = t("catalog.needSku");
       return;
     }
     if (!(price > 0)) {
-      err.textContent = "Enter a valid price.";
+      err.textContent = t("catalog.needPrice");
       return;
     }
     if (!category_id) {
-      err.textContent = "Select a category (or create one first).";
+      err.textContent = t("catalog.needCat");
       return;
     }
 
@@ -1428,7 +1955,7 @@ async function viewCatalog() {
         is_featured,
         is_active: true,
       });
-      toast(`“${created.name}” added to shop`);
+      toast(t("catalog.added", { name: created.name }));
       document.getElementById("p-name").value = "";
       document.getElementById("p-sku").value = "";
       document.getElementById("p-desc").value = "";
@@ -1445,8 +1972,7 @@ async function viewCatalog() {
   };
 
   try {
-    await loadCategories();
-    await loadProducts();
+    await Promise.all([loadCategories(), loadProducts()]);
   } catch (e) {
     toast(e.message, "error");
   }
@@ -1454,6 +1980,12 @@ async function viewCatalog() {
 
 function boot() {
   try {
+    document.documentElement.lang = getLang() === "hi" ? "hi" : "en";
+    document.title = t("meta.title");
+    if (getLang() === "hi" && typeof ensureHiFont === "function") ensureHiFont();
+    document.querySelectorAll("[data-lang-btn]").forEach((btn) => {
+      btn.addEventListener("click", () => setLang(btn.dataset.langBtn));
+    });
     const brand = document.getElementById("brand-home");
     if (brand) {
       brand.addEventListener("click", (e) => {
@@ -1465,12 +1997,19 @@ function boot() {
       btn.addEventListener("click", () => navigate(btn.dataset.page));
     });
     setCartCount(state.cartCount);
+    applyStaticI18n();
     renderChrome();
-    refreshCartSummary().finally(() => navigate("shop"));
+    // Paint shop immediately; validate session + cart in background
+    navigate("shop");
+    if (state.token) {
+      ensureAuthSession()
+        .then(() => refreshCartSummary())
+        .catch((err) => console.error(err));
+    }
   } catch (err) {
     const root = document.getElementById("app");
     if (root) {
-      root.innerHTML = `<div class="panel"><p class="muted">UI failed to start: ${escapeHtml(String(err))}</p></div>`;
+      root.innerHTML = `<div class="panel"><p class="muted">${t("ui.fail")}: ${escapeHtml(String(err))}</p></div>`;
     }
     console.error(err);
   }

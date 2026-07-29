@@ -122,8 +122,68 @@ class ProductResponse(ProductBase):
     brand: Optional[BrandResponse] = None
 
 
+class CategoryBrief(BaseModel):
+    """Minimal category payload for product lists."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    slug: str
+
+
+class ProductListItem(BaseModel):
+    """Lean product card fields — avoids shipping long descriptions on list pages."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    slug: str
+    sku: str
+    price: Decimal
+    stock: int = 0
+    stock_quantity: Optional[int] = None
+    image: Optional[str] = None
+    image_url: Optional[str] = None
+    rating: Decimal = Decimal("0.00")
+    is_active: bool = True
+    is_featured: bool = False
+    category_id: Optional[int] = None
+    category: Optional[CategoryBrief] = None
+
+    @field_validator("price", "rating", mode="before")
+    @classmethod
+    def coerce_decimal(cls, v):  # noqa: ANN001
+        if v is None:
+            return v
+        return Decimal(str(v))
+
+
+class CartProductSummary(BaseModel):
+    """Minimal product fields for cart/checkout line items."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    sku: str = ""
+    price: Decimal
+    stock: int = 0
+    stock_quantity: Optional[int] = None
+    image: Optional[str] = None
+    image_url: Optional[str] = None
+
+    @field_validator("price", mode="before")
+    @classmethod
+    def coerce_decimal(cls, v):  # noqa: ANN001
+        if v is None:
+            return v
+        return Decimal(str(v))
+
+
 class ProductListResponse(BaseModel):
-    items: list[ProductResponse]
+    items: list[ProductListItem]
     total: int
     page: int
     page_size: int

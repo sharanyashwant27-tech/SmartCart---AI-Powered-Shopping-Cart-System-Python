@@ -1,6 +1,6 @@
 """Authentication and user management services."""
 
-from jose import JWTError
+from jose import ExpiredSignatureError, JWTError
 from sqlalchemy.orm import Session
 
 from app.utils.enums import UserRole
@@ -21,10 +21,12 @@ from app.schemas.user import (
     UserResponse,
     UserUpdate,
 )
+from app.services.loyalty_service import LoyaltyService
 
 
 class AuthService:
     def __init__(self, db: Session) -> None:
+        self.db = db
         self.users = UserRepository(db)
 
     def register(self, payload: UserRegister) -> TokenResponse:
@@ -36,8 +38,11 @@ class AuthService:
             name=payload.full_name,
             phone=payload.phone,
             role=UserRole.CUSTOMER,
+            loyalty_points=0,
         )
         user = self.users.create(user)
+        LoyaltyService(self.db).grant_signup_bonus(user)
+        self.db.refresh(user)
         return self._tokens_for(user)
 
     def login(self, email: str, password: str) -> TokenResponse:
@@ -46,6 +51,9 @@ class AuthService:
             raise UnauthorizedError("Invalid email or password")
         if not user.is_active:
             raise UnauthorizedError("Account is inactive")
+        # Guest (customer) and admin accounts both receive full JWT credentials
+        if user.role not in {UserRole.CUSTOMER, UserRole.ADMIN}:
+            raise UnauthorizedError("Unsupported account role")
         return self._tokens_for(user)
 
     def refresh(self, refresh_token: str) -> TokenResponse:
@@ -54,15 +62,42 @@ class AuthService:
             if payload.get("type") != "refresh":
                 raise UnauthorizedError("Invalid refresh token")
             user_id = int(payload["sub"])
+        except ExpiredSignatureError as exc:
+            raise UnauthorizedError("Refresh token expired — please sign in again") from exc
         except (JWTError, KeyError, ValueError) as exc:
-            raise UnauthorizedError("Invalid refresh token") from exc
+            raise UnauthorizedError("Invalid refresh token — please sign in again") from exc
         user = self.users.get_by_id(user_id)
         if user is None or not user.is_active:
             raise UnauthorizedError("User not found or inactive")
+        if user.role not in {UserRole.CUSTOMER, UserRole.ADMIN}:
+            raise UnauthorizedError("Unsupported account role")
         return self._tokens_for(user)
 
+    def validate_credentials(self, access_token: str) -> User:
+        """Validate an access token for guest or admin and return the user."""
+        try:
+            payload = decode_token(access_token)
+            if payload.get("type") != "access":
+                raise UnauthorizedError("Invalid access token")
+            user_id = int(payload["sub"])
+        except ExpiredSignatureError as exc:
+            raise UnauthorizedError("Session expired — please sign in again") from exc
+        except (JWTError, KeyError, ValueError) as exc:
+            raise UnauthorizedError(
+                "Could not validate credentials — please sign in as guest or admin"
+            ) from exc
+        user = self.users.get_by_id(user_id)
+        if user is None or not user.is_active:
+            raise UnauthorizedError("User not found or inactive")
+        if user.role not in {UserRole.CUSTOMER, UserRole.ADMIN}:
+            raise UnauthorizedError("Unsupported account role")
+        return user
+
     def _tokens_for(self, user: User) -> TokenResponse:
-        claims = {"role": user.role.value, "email": user.email}
+        claims = {
+            "role": user.role.value if hasattr(user.role, "value") else str(user.role),
+            "email": user.email,
+        }
         return TokenResponse(
             access_token=create_access_token(str(user.id), claims),
             refresh_token=create_refresh_token(str(user.id)),

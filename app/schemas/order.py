@@ -10,12 +10,27 @@ from app.utils.enums import OrderStatus, PaymentMethod, PaymentStatus
 
 
 class CheckoutRequest(BaseModel):
-    shipping_address: str = Field(..., min_length=10)
-    billing_address: Optional[str] = None
+    shipping_address: str = Field("", min_length=0, max_length=2000)
+    billing_address: Optional[str] = Field(None, max_length=2000)
     coupon_code: Optional[str] = None
     notes: Optional[str] = None
     payment_method: PaymentMethod = PaymentMethod.CARD
     payment_details: Optional[dict] = None
+    redeem_points: int = Field(0, ge=0, description="Loyalty points to redeem (guests)")
+
+    def resolved_shipping(self) -> str:
+        ship = (self.shipping_address or "").strip()
+        bill = (self.billing_address or "").strip()
+        if len(ship) >= 10:
+            return ship
+        if len(bill) >= 10:
+            return bill
+        return ship
+
+    def resolved_billing(self) -> str:
+        bill = (self.billing_address or "").strip()
+        ship = self.resolved_shipping()
+        return bill if len(bill) >= 10 else ship
 
 
 class OrderItemResponse(BaseModel):
@@ -60,6 +75,8 @@ class OrderResponse(BaseModel):
     tax_amount: Decimal
     total_amount: Decimal
     coupon_code: Optional[str]
+    points_earned: int = 0
+    points_redeemed: int = 0
     shipping_address: str
     billing_address: Optional[str]
     notes: Optional[str]
@@ -96,6 +113,10 @@ class PaymentIntentResponse(BaseModel):
     payment_method: PaymentMethod = PaymentMethod.CARD
     payment_instructions: Optional[str] = None
     invoice_url: Optional[str] = None
+    # QR Code Payments (UPI deep-link encoded as PNG)
+    qr_payload: Optional[str] = None
+    qr_image_base64: Optional[str] = None
+    qr_vpa: Optional[str] = None
 
 
 class SalesReportItem(BaseModel):

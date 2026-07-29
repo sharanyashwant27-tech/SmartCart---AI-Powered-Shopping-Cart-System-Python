@@ -44,7 +44,13 @@ async def refresh(payload: RefreshTokenRequest, db: DbSession) -> TokenResponse:
 
 @router.get("/me", response_model=UserResponse)
 async def me(user: CurrentUser) -> UserResponse:
-    """Return the current authenticated user."""
+    """Return the current authenticated user (guest or admin)."""
+    return UserResponse.model_validate(user)
+
+
+@router.get("/validate", response_model=UserResponse)
+async def validate(user: CurrentUser) -> UserResponse:
+    """Validate bearer credentials for guest (customer) or admin accounts."""
     return UserResponse.model_validate(user)
 
 

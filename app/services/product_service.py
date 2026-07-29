@@ -19,6 +19,7 @@ from app.schemas.product import (
     CategoryCreate,
     CategoryUpdate,
     ProductCreate,
+    ProductListItem,
     ProductListResponse,
     ProductResponse,
     ProductUpdate,
@@ -202,7 +203,7 @@ class ProductService:
             limit=page_size,
         )
         return ProductListResponse(
-            items=[ProductResponse.model_validate(i) for i in items],
+            items=[ProductListItem.model_validate(i) for i in items],
             total=total,
             page=page,
             page_size=page_size,

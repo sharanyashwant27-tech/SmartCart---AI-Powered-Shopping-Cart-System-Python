@@ -7,7 +7,7 @@ from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.utils.enums import CartItemStatus, CouponType
-from app.schemas.product import ProductResponse
+from app.schemas.product import CartProductSummary, ProductResponse
 
 
 class CartItemCreate(BaseModel):
@@ -26,14 +26,14 @@ class CartItemResponse(BaseModel):
     product_id: int
     quantity: int
     status: CartItemStatus
-    product: ProductResponse
+    product: CartProductSummary
     line_total: Decimal
     created_at: datetime
 
 
 class CartSummary(BaseModel):
     items: list[CartItemResponse]
-    saved_for_later: list[CartItemResponse]
+    saved_for_later: list[CartItemResponse] = []
     subtotal: Decimal
     discount_amount: Decimal
     shipping_amount: Decimal

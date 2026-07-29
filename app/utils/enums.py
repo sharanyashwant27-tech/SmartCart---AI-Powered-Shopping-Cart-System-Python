@@ -36,6 +36,7 @@ class CouponType(str, enum.Enum):
 class PaymentMethod(str, enum.Enum):
     CARD = "card"
     UPI = "upi"
+    QR = "qr"
     NETBANKING = "netbanking"
     WALLET = "wallet"
     COD = "cod"

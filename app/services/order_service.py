@@ -12,10 +12,12 @@ from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.models.order import Order, OrderItem, Payment
+from app.models.product import Product
 from app.models.user import User
 from app.repositories.cart_repository import CartRepository
 from app.repositories.order_repository import OrderRepository, PaymentRepository
 from app.repositories.product_repository import ProductRepository
+from app.repositories.user_repository import UserRepository
 from app.schemas.order import (
     AnalyticsOverview,
     CheckoutRequest,
@@ -28,6 +30,8 @@ from app.schemas.order import (
     SalesReportResponse,
 )
 from app.services.cart_service import CartService, CouponService, _money
+from app.services.loyalty_service import LoyaltyService
+from app.services.qr_service import payment_qr
 from app.utils.enums import OrderStatus, PaymentMethod, PaymentStatus, UserRole
 from app.utils.exceptions import ForbiddenError, NotFoundError, PaymentError, ValidationAppError
 from app.utils.helpers import generate_order_number
@@ -38,6 +42,7 @@ settings = get_settings()
 PAYMENT_METHOD_LABELS = {
     PaymentMethod.CARD: "Card / Stripe",
     PaymentMethod.UPI: "UPI",
+    PaymentMethod.QR: "QR Code",
     PaymentMethod.NETBANKING: "Internet Banking",
     PaymentMethod.WALLET: "Digital Wallet",
     PaymentMethod.COD: "Cash on Delivery",
@@ -53,16 +58,34 @@ class OrderService:
         self.cart_repo = CartRepository(db)
         self.products = ProductRepository(db)
         self.coupons = CouponService(db)
+        self.loyalty = LoyaltyService(db)
 
     def checkout(self, user: User, payload: CheckoutRequest) -> PaymentIntentResponse:
         summary = self.cart.calculate_totals(user.id, payload.coupon_code)
         if not summary.items:
             raise ValidationAppError("Cart is empty")
 
+        shipping_address = payload.resolved_shipping()
+        billing_address = payload.resolved_billing()
+        if len(shipping_address) < 10:
+            raise ValidationAppError(
+                "Enter a full shipping or billing address (at least 10 characters)"
+            )
+
         for item in summary.items:
             product = self.products.get_by_id(item.product_id)
             if product is None or product.stock_quantity < item.quantity:
                 raise ValidationAppError(f"Insufficient stock for {item.product.name}")
+
+        redeem_points = int(payload.redeem_points or 0)
+        points_discount = Decimal("0.00")
+        if redeem_points > 0:
+            points_discount = self.loyalty.points_to_money(redeem_points)
+            # Validate against payable before applying (will debit after order flush)
+            self.loyalty.validate_redeem(user, redeem_points, summary.total)
+
+        discount_amount = _money(summary.discount_amount + points_discount)
+        total_amount = _money(max(summary.total - points_discount, Decimal("0")))
 
         method = payload.payment_method or PaymentMethod.CARD
         order = Order(
@@ -71,17 +94,27 @@ class OrderService:
             status=OrderStatus.PENDING,
             payment_status=PaymentStatus.PENDING,
             subtotal=summary.subtotal,
-            discount_amount=summary.discount_amount,
+            discount_amount=discount_amount,
             shipping_amount=summary.shipping_amount,
             tax_amount=summary.tax_amount,
-            total_amount=summary.total,
+            total_amount=total_amount,
             coupon_code=summary.coupon_code,
-            shipping_address=payload.shipping_address,
-            billing_address=payload.billing_address or payload.shipping_address,
+            points_earned=0,
+            points_redeemed=0,
+            shipping_address=shipping_address,
+            billing_address=billing_address or shipping_address,
             notes=payload.notes,
         )
         self.db.add(order)
         self.db.flush()
+
+        if redeem_points > 0:
+            self.loyalty.redeem_against_payable(
+                user, order, redeem_points, summary.total
+            )
+            # Re-apply final totals after validation
+            order.discount_amount = discount_amount
+            order.total_amount = total_amount
 
         for item in summary.items:
             self.db.add(
@@ -107,7 +140,7 @@ class OrderService:
 
         payment = Payment(
             order_id=order.id,
-            amount=summary.total,
+            amount=order.total_amount,
             currency=settings.currency,
             status=PaymentStatus.PENDING,
             provider=method.value,
@@ -131,6 +164,9 @@ class OrderService:
         client_secret: Optional[str] = None
         intent_id: Optional[str] = None
         instructions = ""
+        qr_payload: Optional[str] = None
+        qr_image_base64: Optional[str] = None
+        qr_vpa: Optional[str] = None
 
         if method == PaymentMethod.CARD:
             if (
@@ -166,15 +202,41 @@ class OrderService:
                 message = "Card payment (sandbox)"
                 instructions = "Use test card 4242 4242 4242 4242 to pay."
 
-        elif method == PaymentMethod.UPI:
-            vpa = str(details.get("upi_id") or details.get("vpa") or "smartcart@upi")
-            intent_id = f"upi_{uuid.uuid4().hex}"
-            client_secret = intent_id
-            message = f"UPI payment initiated to {vpa}"
-            instructions = (
-                f"Open any UPI app and pay ${float(order.total_amount):.2f} to "
-                f"<b>{vpa}</b>. Then confirm payment below. (Sandbox simulation)"
+        elif method in {PaymentMethod.UPI, PaymentMethod.QR}:
+            vpa = str(
+                details.get("upi_id")
+                or details.get("vpa")
+                or details.get("merchant_vpa")
+                or "smartcart@upi"
             )
+            qr = payment_qr(
+                amount=order.total_amount,
+                order_number=order.order_number,
+                vpa=vpa,
+                payee_name="SmartCart",
+                currency=(settings.currency or "inr").upper()
+                if (settings.currency or "").lower() == "inr"
+                else "INR",
+            )
+            qr_payload = qr["payload"]
+            qr_image_base64 = qr["image_base64"]
+            qr_vpa = qr["vpa"]
+            if method == PaymentMethod.QR:
+                intent_id = f"qr_{uuid.uuid4().hex}"
+                message = "Scan QR code to pay for your cart"
+                instructions = (
+                    f"Scan the QR with any UPI app (GPay, PhonePe, BHIM) and pay "
+                    f"<b>${float(order.total_amount):.2f}</b> to <b>{vpa}</b>. "
+                    "After payment, confirm below to generate your bill. (Sandbox)"
+                )
+            else:
+                intent_id = f"upi_{uuid.uuid4().hex}"
+                message = f"UPI payment initiated to {vpa}"
+                instructions = (
+                    f"Scan the QR or pay ${float(order.total_amount):.2f} to "
+                    f"<b>{vpa}</b> in your UPI app, then confirm. (Sandbox)"
+                )
+            client_secret = intent_id
 
         elif method == PaymentMethod.NETBANKING:
             bank = str(details.get("bank") or "Demo Bank")
@@ -221,6 +283,9 @@ class OrderService:
             payment_method=method,
             payment_instructions=instructions,
             invoice_url=f"/api/v1/orders/{order.id}/invoice",
+            qr_payload=qr_payload,
+            qr_image_base64=qr_image_base64,
+            qr_vpa=qr_vpa,
         )
 
     def confirm_payment(
@@ -236,7 +301,7 @@ class OrderService:
 
         stored = order.payment.stripe_payment_intent_id or ""
         provided = payload.payment_intent_id or payload.payment_reference or stored
-        sandbox_prefixes = ("pi_sim_", "upi_", "nb_", "wallet_", "cod_")
+        sandbox_prefixes = ("pi_sim_", "upi_", "qr_", "nb_", "wallet_", "cod_")
         if (
             stored
             and provided
@@ -255,6 +320,11 @@ class OrderService:
                     f"{stored or provided}|ref:{payload.payment_reference}"
                 )
             self.cart_repo.clear_active(order.user_id)
+            owner = order.user
+            if owner is None:
+                owner = self.db.get(User, order.user_id)
+            if owner is not None:
+                self.loyalty.earn_for_paid_order(owner, order)
             message_status = "succeeded"
         else:
             order.payment.status = PaymentStatus.FAILED
@@ -266,6 +336,11 @@ class OrderService:
                     product = self.products.get_by_id(item.product_id)
                     if product:
                         product.stock += item.quantity
+            owner = order.user
+            if owner is None:
+                owner = self.db.get(User, order.user_id)
+            if owner is not None:
+                self.loyalty.restore_redeem_on_failed_payment(owner, order)
             message_status = "failed"
 
         self.db.commit()
@@ -327,9 +402,15 @@ class OrderService:
             order.payment.status = PaymentStatus.REFUNDED
             order.payment_status = PaymentStatus.REFUNDED
             order.status = OrderStatus.REFUNDED
+            owner = order.user or self.db.get(User, order.user_id)
+            if owner is not None:
+                self.loyalty.reverse_earn_on_refund(owner, order)
         elif order.payment and order.payment.status == PaymentStatus.PENDING:
             order.payment.status = PaymentStatus.CANCELLED
             order.payment_status = PaymentStatus.CANCELLED
+            owner = order.user or self.db.get(User, order.user_id)
+            if owner is not None:
+                self.loyalty.restore_redeem_on_failed_payment(owner, order)
         self.db.commit()
         self.db.refresh(order)
         return order
@@ -360,6 +441,9 @@ class OrderService:
         if order.payment:
             order.payment.status = PaymentStatus.REFUNDED
             order.payment_status = PaymentStatus.REFUNDED
+        owner = order.user or self.db.get(User, order.user_id)
+        if owner is not None:
+            self.loyalty.reverse_earn_on_refund(owner, order)
         self.db.commit()
         self.db.refresh(order)
         return order
@@ -468,7 +552,7 @@ class AnalyticsService:
             .scalar()
         )
         pending = self.orders.count([Order.status == OrderStatus.PENDING])
-        low_stock = self.products.count([Product.stock_quantity <= 5])
+        low_stock = self.products.count([Product.stock <= 5])
 
         top = (
             self.db.query(

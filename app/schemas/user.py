@@ -50,6 +50,7 @@ class UserResponse(BaseModel):
     phone: Optional[str] = None
     role: UserRole
     is_active: bool
+    loyalty_points: int = 0
     address_line1: Optional[str] = None
     address_line2: Optional[str] = None
     city: Optional[str] = None

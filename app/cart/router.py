@@ -13,7 +13,7 @@ from app.schemas.cart import (
     CouponResponse,
     CouponUpdate,
 )
-from app.schemas.product import ProductResponse
+from app.schemas.product import CartProductSummary
 from app.schemas.user import MessageResponse
 from app.services.cart_service import CartService, CouponService
 
@@ -32,7 +32,7 @@ def _item_response(item) -> CartItemResponse:  # noqa: ANN001
         product_id=item.product_id,
         quantity=item.quantity,
         status=item.status,
-        product=ProductResponse.model_validate(item.product),
+        product=CartProductSummary.model_validate(item.product),
         line_total=line,
         created_at=item.created_at,
     )

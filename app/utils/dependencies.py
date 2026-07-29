@@ -2,17 +2,17 @@
 
 from typing import Annotated, Optional
 
-from fastapi import Depends, Header
+from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError
+from jose import ExpiredSignatureError, JWTError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.models.user import User
+from app.repositories.user_repository import UserRepository
 from app.utils.enums import UserRole
 from app.utils.exceptions import ForbiddenError, UnauthorizedError
 from app.utils.security import decode_token
-from app.models.user import User
-from app.repositories.user_repository import UserRepository
 
 bearer_scheme = HTTPBearer(auto_error=False)
 DbSession = Annotated[Session, Depends(get_db)]
@@ -24,22 +24,61 @@ def get_current_user(
         Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)
     ] = None,
 ) -> User:
-    """Resolve the authenticated user from the Bearer JWT."""
+    """Resolve the authenticated user (guest/customer or admin) from the Bearer JWT."""
     if credentials is None or not credentials.credentials:
-        raise UnauthorizedError("Missing authentication token")
+        raise UnauthorizedError(
+            "Please sign in as a guest or admin to continue",
+            extra={"code": "missing_token"},
+        )
+    token = credentials.credentials.strip()
+    if not token or token.lower() in {"null", "undefined", "bearer"}:
+        raise UnauthorizedError(
+            "Please sign in as a guest or admin to continue",
+            extra={"code": "missing_token"},
+        )
     try:
-        payload = decode_token(credentials.credentials)
+        payload = decode_token(token)
         if payload.get("type") != "access":
-            raise UnauthorizedError("Invalid token type")
+            raise UnauthorizedError(
+                "Invalid access token — please sign in again",
+                extra={"code": "invalid_token_type"},
+            )
         user_id = payload.get("sub")
-        if not user_id:
-            raise UnauthorizedError("Invalid token subject")
-    except JWTError as exc:
-        raise UnauthorizedError("Could not validate credentials") from exc
+        if user_id is None or user_id == "":
+            raise UnauthorizedError(
+                "Invalid token subject — please sign in again",
+                extra={"code": "invalid_subject"},
+            )
+        user = UserRepository(db).get_by_id(int(user_id))
+    except ExpiredSignatureError as exc:
+        raise UnauthorizedError(
+            "Session expired — please sign in again",
+            extra={"code": "token_expired"},
+        ) from exc
+    except UnauthorizedError:
+        raise
+    except (JWTError, ValueError, TypeError) as exc:
+        raise UnauthorizedError(
+            "Could not validate credentials — please sign in as guest or admin",
+            extra={"code": "invalid_token"},
+        ) from exc
 
-    user = UserRepository(db).get_by_id(int(user_id))
-    if user is None or not user.is_active:
-        raise UnauthorizedError("User inactive or not found")
+    if user is None:
+        raise UnauthorizedError(
+            "Account not found — please sign in again",
+            extra={"code": "user_not_found"},
+        )
+    if not user.is_active:
+        raise UnauthorizedError(
+            "Account is inactive",
+            extra={"code": "user_inactive"},
+        )
+    # Guest (customer) and admin are both valid cart/checkout actors
+    if user.role not in {UserRole.CUSTOMER, UserRole.ADMIN}:
+        raise UnauthorizedError(
+            "Unsupported account role",
+            extra={"code": "invalid_role"},
+        )
     return user
 
 
@@ -67,7 +106,7 @@ def get_optional_user(
         Optional[HTTPAuthorizationCredentials], Depends(bearer_scheme)
     ] = None,
 ) -> Optional[User]:
-    """Return user if token present, otherwise None."""
+    """Return user if token present and valid, otherwise None."""
     if credentials is None or not credentials.credentials:
         return None
     try:

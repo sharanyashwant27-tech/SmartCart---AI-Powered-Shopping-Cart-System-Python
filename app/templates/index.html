@@ -6,7 +6,12 @@
   <title>SmartCart — AI-Powered Shopping</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Sora:wght@700;800&display=swap" rel="stylesheet" />
+  <!-- Outfit only on first paint; Devanagari loads lazily for Hindi -->
+  <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;700&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;700&display=swap" media="print" onload="this.media='all'" />
+  <noscript>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Outfit:wght@500;700&display=swap" />
+  </noscript>
   <link rel="stylesheet" href="/static/app.css" />
 </head>
 <body>
@@ -14,6 +19,10 @@
     <aside class="sidebar">
       <a href="/" class="brand" id="brand-home" title="Go to shop">SmartCart</a>
       <div class="brand-sub">AI-Powered Shopping · :8904</div>
+      <div class="lang-switch" role="group" aria-label="Language">
+        <button type="button" class="lang-btn active" data-lang-btn="en" id="lang-en">EN</button>
+        <button type="button" class="lang-btn" data-lang-btn="hi" id="lang-hi">हिं</button>
+      </div>
       <button class="nav-btn active" data-page="shop">Shop</button>
       <button class="nav-btn" data-page="cart">Cart <span id="cart-badge" class="nav-badge hidden"></span></button>
       <button class="nav-btn" data-page="orders">Orders</button>
@@ -22,9 +31,10 @@
       <button class="nav-btn hidden" data-page="catalog" id="nav-catalog">Manage Products</button>
       <div class="user-box" id="user-box"></div>
     </aside>
-    <main class="main" id="app"></main>
+    <main class="main" id="app"><div class="muted" style="padding:1rem">Loading…</div></main>
   </div>
   <div id="toast" class="toast" role="status"></div>
-  <script src="/static/app.js"></script>
+  <script src="/static/i18n.js" defer></script>
+  <script src="/static/app.js" defer></script>
 </body>
 </html>

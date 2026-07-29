@@ -60,6 +60,8 @@ class Order(Base):
         Numeric(12, 2), default=Decimal("0.00"), nullable=False
     )
     coupon_code: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    points_earned: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    points_redeemed: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     billing_address: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     tracking_number: Mapped[Optional[str]] = mapped_column(String(80), nullable=True, index=True)

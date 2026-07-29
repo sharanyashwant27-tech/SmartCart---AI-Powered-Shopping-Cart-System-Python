@@ -12,7 +12,23 @@ SmartCart core schema (production model includes additional helper columns; syno
 | password | VARCHAR(255) | bcrypt hash |
 | phone | VARCHAR(30) | nullable |
 | role | ENUM | `customer` / `admin` |
+| loyalty_points | INTEGER | Guest loyalty balance (default 0) |
 | created_at | DATETIME | |
+
+## Loyalty Transactions (`loyalty_transactions`)
+
+| Column | Type | Notes |
+|--------|------|-------|
+| id | INTEGER PK | |
+| user_id | FK → users | Guest customer |
+| order_id | FK → orders | nullable |
+| points | INTEGER | +earn / −redeem |
+| balance_after | INTEGER | Snapshot |
+| tx_type | VARCHAR(30) | `signup`, `earn`, `redeem`, `redeem_refund`, `earn_reversal` |
+| note | TEXT | |
+| created_at | DATETIME | |
+
+**Rules:** guests earn **1 point per $1** paid; **100 points = $1** off; min redeem **100**; new guests get **50** signup bonus.
 
 ## Products
 
@@ -49,6 +65,8 @@ SmartCart core schema (production model includes additional helper columns; syno
 | status | ENUM | pending → delivered / cancelled / returned |
 | payment_status | ENUM | pending / succeeded / failed / refunded |
 | total_amount | NUMERIC(12,2) | |
+| points_earned | INTEGER | Loyalty awarded after payment |
+| points_redeemed | INTEGER | Points spent at checkout |
 | shipping_address | TEXT | |
 
 ## Order Items

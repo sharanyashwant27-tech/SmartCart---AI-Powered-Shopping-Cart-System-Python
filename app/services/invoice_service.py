@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import io
 from datetime import datetime
 
@@ -9,9 +10,17 @@ from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import (
+    Image,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 from app.models.order import Order
+from app.services.qr_service import qr_png_base64
 
 
 def build_invoice_pdf(order: Order) -> bytes:
@@ -32,7 +41,9 @@ def build_invoice_pdf(order: Order) -> bytes:
         textColor=colors.HexColor("#0f766e"),
         spaceAfter=6,
     )
-    muted = ParagraphStyle("Muted", parent=styles["Normal"], textColor=colors.HexColor("#5b6b76"))
+    muted = ParagraphStyle(
+        "Muted", parent=styles["Normal"], textColor=colors.HexColor("#5b6b76")
+    )
 
     story = [
         Paragraph("SmartCart", title),
@@ -50,7 +61,10 @@ def build_invoice_pdf(order: Order) -> bytes:
         ),
         Spacer(1, 0.15 * inch),
         Paragraph(f"<b>Ship to:</b> {order.shipping_address}", styles["Normal"]),
-        Paragraph(f"<b>Bill to:</b> {order.billing_address or order.shipping_address}", styles["Normal"]),
+        Paragraph(
+            f"<b>Bill to:</b> {order.billing_address or order.shipping_address}",
+            styles["Normal"],
+        ),
     ]
     if order.payment:
         method = (order.payment.provider or "card").replace("_", " ").title()
@@ -76,7 +90,9 @@ def build_invoice_pdf(order: Order) -> bytes:
             ]
         )
 
-    table = Table(rows, colWidths=[2.6 * inch, 1.1 * inch, 0.6 * inch, 0.9 * inch, 1.0 * inch])
+    table = Table(
+        rows, colWidths=[2.6 * inch, 1.1 * inch, 0.6 * inch, 0.9 * inch, 1.0 * inch]
+    )
     table.setStyle(
         TableStyle(
             [
@@ -84,7 +100,12 @@ def build_invoice_pdf(order: Order) -> bytes:
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                 ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#d7e0db")),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f3f6f4")]),
+                (
+                    "ROWBACKGROUNDS",
+                    (0, 1),
+                    (-1, -1),
+                    [colors.white, colors.HexColor("#f3f6f4")],
+                ),
                 ("ALIGN", (2, 1), (-1, -1), "RIGHT"),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("TOPPADDING", (0, 0), (-1, -1), 6),
@@ -118,6 +139,14 @@ def build_invoice_pdf(order: Order) -> bytes:
     if order.coupon_code:
         story.append(Spacer(1, 0.1 * inch))
         story.append(Paragraph(f"Coupon applied: <b>{order.coupon_code}</b>", muted))
+    if getattr(order, "points_redeemed", 0):
+        story.append(
+            Paragraph(f"Loyalty points redeemed: <b>{order.points_redeemed}</b>", muted)
+        )
+    if getattr(order, "points_earned", 0):
+        story.append(
+            Paragraph(f"Loyalty points earned: <b>{order.points_earned}</b>", muted)
+        )
     if order.tracking_number:
         story.append(
             Paragraph(
@@ -125,6 +154,29 @@ def build_invoice_pdf(order: Order) -> bytes:
                 muted,
             )
         )
+
+    try:
+        verify_payload = (
+            f"SMARTCART|ORDER={order.order_number}|TOTAL={float(order.total_amount):.2f}"
+            f"|STATUS={order.payment_status.value}"
+        )
+        b64 = qr_png_base64(verify_payload, box_size=4, border=1)
+        qr_img = Image(
+            io.BytesIO(base64.b64decode(b64)), width=1.1 * inch, height=1.1 * inch
+        )
+        story.append(Spacer(1, 0.3 * inch))
+        story.append(Paragraph("Scan for bill verification", muted))
+        story.append(qr_img)
+    except Exception:  # noqa: BLE001
+        pass
+
+    story.append(Spacer(1, 0.2 * inch))
+    story.append(
+        Paragraph(
+            "This bill was generated after successful payment. Thank you for shopping with SmartCart.",
+            muted,
+        )
+    )
 
     doc.build(story)
     return buffer.getvalue()

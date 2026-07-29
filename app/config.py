@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     default_shipping_flat: float = 5.99
     free_shipping_threshold: float = 75.00
 
+    # Loyalty (guest / customer shoppers)
+    loyalty_points_per_dollar: int = 1  # earn 1 pt per $1 paid
+    loyalty_cents_per_point: int = 1  # 100 pts = $1.00
+    loyalty_min_redeem_points: int = 100
+    loyalty_signup_bonus: int = 50
+
     # Rate limiting
     rate_limit: str = "100/minute"
 

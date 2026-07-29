@@ -22,7 +22,7 @@ Production-ready shopping cart built with **Python** and **FastAPI**. The web st
 | Database | SQLite (dev/Docker default), PostgreSQL (production) |
 | ORM | SQLAlchemy |
 | Authentication | JWT |
-| Payments | Card, UPI, Net Banking, Wallet, COD (+ Stripe sandbox) |
+| Payments | Card, UPI, QR Code, Net Banking, Wallet, COD (+ Stripe sandbox) |
 | AI | OpenAI API (optional) |
 | Testing | Pytest |
 | Containers | Docker + Docker Compose |
@@ -32,14 +32,17 @@ Production-ready shopping cart built with **Python** and **FastAPI**. The web st
 
 | Module | Capabilities |
 |--------|----------------|
-| Auth | Register / login (guest + admin), JWT |
+| Auth | Register / login (guest + admin), JWT with session refresh |
 | Shop | Categories, search, product details, images |
-| Cart | Qty update, coupons, totals |
-| Checkout | Shipping + payment method selection |
-| Payments | Card, UPI, Internet Banking, Wallet, Cash on Delivery |
-| Bills | PDF invoice/bill for guests and admin |
-| Admin | Dashboard KPIs, manage products & categories |
+| Cart | Add / remove, **+/- quantity**, editable qty, coupons, live totals |
+| Checkout | Shipping + billing, remove items before pay, payment method selection |
+| Payments | Card, UPI, **QR Code**, Internet Banking, Wallet, Cash on Delivery (+ Stripe sandbox) |
+| Bills | PDF invoice with verification QR; auto-download after payment |
+| Loyalty | Points for guests (earn on paid orders, redeem at checkout) |
+| i18n | English / Hindi storefront language toggle |
+| Admin | Dashboard KPIs, manage products & categories, orders |
 | Analytics | Revenue, orders, inventory, coupons |
+| Performance | Cached static assets, Gzip, lean product/cart APIs, SPA cache |
 | Security | JWT, RBAC, CORS, rate limiting |
 
 ## Demo credentials
@@ -48,7 +51,8 @@ Production-ready shopping cart built with **Python** and **FastAPI**. The web st
 |------|-------|----------|
 | Admin | `admin@smartcart.com` | `Admin@12345` |
 
-Coupons: `WELCOME10` (10% off), `SAVE5` ($5 off)
+Coupons: `WELCOME10` (10% off), `SAVE5` ($5 off)  
+Loyalty: +50 points on signup · 1 pt / $1 paid · 100 pts = $1 off
 
 ---
 
@@ -82,7 +86,7 @@ docker compose down
 ### Useful Docker commands
 
 ```bash
-# Rebuild image only
+# Rebuild image only (includes README.md)
 docker build -t smartcart-api:latest .
 
 # Run API container without Compose
@@ -93,6 +97,11 @@ docker compose logs -f api
 
 # Health check
 curl http://localhost:8904/health
+
+# Confirm README.md is inside the image / container
+docker run --rm smartcart-api:latest head -n 8 /app/README.md
+# or, with Compose running:
+docker compose exec api head -n 8 /app/README.md
 ```
 
 ### Optional profiles
@@ -116,16 +125,12 @@ API then uses `postgresql+psycopg2://smartcart:smartcart@db:5432/smartcart`.
 The `Dockerfile` builds a Python 3.12 slim image that:
 
 - Installs dependencies from `requirements.txt`
-- Ships the FastAPI app, static storefront assets, and **`README.md`** (verified at build time)
+- Copies the full application (`.dockerignore` excludes docs noise but **keeps `README.md`**)
+- Explicitly copies and verifies **`/app/README.md`** at build time (`test -f /app/README.md`)
+- Ships the FastAPI app and static storefront assets (`/static`)
 - Exposes **8904** (API/UI) and **8501** (optional Streamlit)
 - Includes a healthcheck on `/health`
 - Defaults to: `uvicorn app.main:app --host 0.0.0.0 --port 8904`
-
-Confirm README is inside a running container:
-
-```bash
-docker compose exec api head -n 5 /app/README.md
-```
 
 Persistent volumes (Compose): `smartcart_data` (SQLite), `smartcart_uploads`, `smartcart_logs`.
 
@@ -154,13 +159,14 @@ streamlit run frontend/Home.py --server.port 8501
 ## Architecture
 
 ```
-app/                 # FastAPI domains (auth, cart, checkout, orders, admin, …)
+app/                 # FastAPI domains (auth, cart, checkout, orders, loyalty, admin, …)
 frontend/            # Optional Streamlit UI
-static/              # Storefront CSS/JS served at /
+static/              # Storefront CSS/JS/i18n served at /
 tests/
 Dockerfile
 docker-compose.yml
 docs/
+README.md            # Also baked into the Docker image at /app/README.md
 ```
 
 ## API documentation
@@ -173,9 +179,12 @@ Interactive OpenAPI docs: http://localhost:8904/docs
 | POST | `/api/v1/auth/login` | Obtain JWT |
 | GET | `/api/v1/products` | List / search products |
 | POST | `/api/v1/cart/items` | Add to cart |
-| POST | `/api/v1/checkout` | Create order (`payment_method`: card/upi/netbanking/wallet/cod) |
+| PATCH | `/api/v1/cart/items/{id}` | Update cart item quantity |
+| DELETE | `/api/v1/cart/items/{id}` | Remove cart item |
+| POST | `/api/v1/checkout` | Create order (`payment_method`: card/upi/qr/netbanking/wallet/cod) |
 | POST | `/api/v1/payments/orders/{id}/confirm` | Confirm payment |
 | GET | `/api/v1/orders/{id}/invoice` | Download PDF bill |
+| GET | `/api/v1/loyalty/me` | Loyalty balance (guests) |
 | GET | `/api/v1/admin/orders/{id}/invoice` | Admin bill download |
 | GET | `/api/v1/analytics/dashboard` | Admin dashboard KPIs |
 

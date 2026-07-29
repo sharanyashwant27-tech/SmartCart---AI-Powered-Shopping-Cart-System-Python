@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Optional
 
 from sqlalchemy import func
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, joinedload, noload
 
 from app.utils.enums import OrderStatus, PaymentStatus
 from app.models.order import Order, OrderItem, Payment
@@ -36,9 +36,10 @@ class OrderRepository(BaseRepository[Order]):
         )
 
     def list_for_user(self, user_id: int, skip: int = 0, limit: int = 50) -> list[Order]:
+        # List views do not render line items — skip that join entirely
         return (
             self.db.query(Order)
-            .options(joinedload(Order.items), joinedload(Order.payment))
+            .options(joinedload(Order.payment), noload(Order.items))
             .filter(Order.user_id == user_id)
             .order_by(Order.created_at.desc())
             .offset(skip)
@@ -53,12 +54,19 @@ class OrderRepository(BaseRepository[Order]):
         skip: int = 0,
         limit: int = 50,
     ) -> tuple[list[Order], int]:
-        query = self.db.query(Order).options(
-            joinedload(Order.items), joinedload(Order.payment)
-        )
+        filters = []
         if status is not None:
-            query = query.filter(Order.status == status)
-        total = query.count()
+            filters.append(Order.status == status)
+        count_q = self.db.query(Order)
+        for f in filters:
+            count_q = count_q.filter(f)
+        total = count_q.count()
+
+        query = self.db.query(Order).options(
+            joinedload(Order.payment), noload(Order.items)
+        )
+        for f in filters:
+            query = query.filter(f)
         items = query.order_by(Order.created_at.desc()).offset(skip).limit(limit).all()
         return items, total
 
